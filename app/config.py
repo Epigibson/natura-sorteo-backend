@@ -1,0 +1,36 @@
+"""Application settings for sorteo-natura backend."""
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_name: str = "sorteo-natura-api"
+    env: str = "dev"
+
+    # MongoDB (replica set opcional; sin transacciones multi-doc)
+    mongo_url: str = "mongodb://localhost:27017"
+    mongo_db: str = "sorteo_natura"
+
+    # JWT
+    jwt_secret: str = "dev-only-secret-change-me-32bytes-min!!"
+    jwt_alg: str = "HS256"
+    access_ttl_min: int = 60
+    refresh_ttl_days: int = 14
+
+    # Seed admin (dev bootstrap — cambiar en producción)
+    seed_admin_phone: str = "5500000000"
+    seed_admin_password: str = "AdminDev123!"
+    seed_admin_name: str = "Yuri"
+
+    # CORS — Angular dev server
+    cors_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
