@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pymongo>=4.8
+pydantic>=2.8
+pydantic-settings>=2.4
+PyJWT>=2.9
+argon2-cffi>=23.1
+openpyxl>=3.1
