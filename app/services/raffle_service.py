@@ -1,6 +1,7 @@
 """Lógica de rifa: generación de boletos, códigos, asignación."""
 from __future__ import annotations
 
+import random
 import re
 import secrets
 import string
@@ -74,6 +75,7 @@ def crear_sorteo(
         i += 1
 
     montos = list(range(price_min, price_max + 1))
+    random.shuffle(montos)  # BARAJAR montos para que folio no = precio ordenado
     codigos = _next_folio_codes(n)
 
     doc = {
