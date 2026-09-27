@@ -28,11 +28,16 @@ def seed_admin(db) -> None:
     print(f"[seed] admin creado: {get_settings().seed_admin_phone} / {get_settings().seed_admin_password}")
 
 
+def _new_code():
+    import secrets
+    return "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(4))
+
+
 async def _auto_close_loop():
     """Cierra sorteos automáticamente cuando llega la fecha del sorteo."""
     while True:
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime, timedelta, timezone
             db = get_db()
             now = datetime.now(timezone.utc)
             # Cerrar sorteos abiertos cuya fecha ya pasó
@@ -40,6 +45,26 @@ async def _auto_close_loop():
                 {"status": "open", "draw_date": {"$ne": None, "$lte": now.strftime("%Y-%m-%d")}},
                 {"$set": {"status": "closed"}},
             )
+            # Auto-liberar boletos raspados sin pagar después de 24h
+            cutoff = now - timedelta(hours=24)
+            expired = db.tickets.find({
+                "status": {"$in": ["registered", "scratched"]},
+                "registered_at": {"$lt": cutoff},
+            })
+            for t in expired:
+                db.tickets.update_one(
+                    {"_id": t["_id"]},
+                    {"$set": {
+                        "status": "free",
+                        "participant": None,
+                        "delivered_at": None,
+                        "registered_at": None,
+                        "scratched_at": None,
+                        "access_code": _new_code(),
+                        "updated_at": now,
+                    }},
+                )
+                print(f"[auto-release] folio {t['folio']} liberado (sin pagar)")
         except Exception as exc:
             print(f"[auto-close] error: {exc}")
         await asyncio.sleep(3600)

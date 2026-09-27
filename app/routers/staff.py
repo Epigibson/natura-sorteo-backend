@@ -503,8 +503,15 @@ async def upload_image(
         secure=True,
     )
 
+    # Validar tipo de archivo
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(400, "Solo se permiten imágenes JPG, PNG, WebP o GIF")
+
     try:
         content = await file.read()
+        if len(content) > 5 * 1024 * 1024:
+            raise HTTPException(400, "Imagen muy grande (máx 5 MB)")
         import base64
         b64 = base64.b64encode(content).decode("utf-8")
         mime = file.content_type or "image/jpeg"

@@ -17,6 +17,17 @@ from app.schemas import (
 from app.services import raffle_service as rs
 
 router = APIRouter(prefix="/api/v1/public", tags=["public"])
+# Rate limit global para endpoints públicos
+_public_rate: dict[str, list] = {}
+
+def _check_rate(key: str, max_per_min: int = 10):
+    import time
+    now = time.time()
+    _public_rate[key] = [t for t in _public_rate.get(key, []) if now - t < 60]
+    if len(_public_rate[key]) >= max_per_min:
+        raise HTTPException(429, "Demasiados intentos. Espera un minuto.")
+    _public_rate[key].append(now)
+
 
 
 @router.get("/raffles/{slug}", response_model=PublicRaffleOut)
@@ -62,7 +73,7 @@ def public_board(slug: str) -> dict:
             {
                 "folio": t["folio"],
                 "status": t.get("status", "free"),
-                "has_name": bool(p.get("name")),
+                "has_name": bool(p.get("name")),  # solo para admin
             }
         )
 
@@ -90,6 +101,7 @@ def public_board(slug: str) -> dict:
 
 @router.post("/access", response_model=AccessCheckOut)
 def access(body: AccessCheckIn) -> AccessCheckOut:
+    _check_rate("access:" + body.raffle_slug, max_per_min=15)
     result = rs.check_access(get_db(), body.raffle_slug, body.folio, body.code)
     if not result.get("ok"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, result.get("message", "Acceso denegado"))
@@ -98,6 +110,7 @@ def access(body: AccessCheckIn) -> AccessCheckOut:
 
 @router.post("/register")
 def register(body: RegisterIn) -> dict:
+    _check_rate("register:" + body.raffle_slug, max_per_min=10)
     result = rs.register_participant(
         get_db(),
         body.raffle_slug,
@@ -113,6 +126,7 @@ def register(body: RegisterIn) -> dict:
 
 @router.post("/scratch", response_model=ScratchOut)
 def scratch(body: ScratchIn) -> ScratchOut:
+    _check_rate("scratch:" + body.raffle_slug, max_per_min=15)
     result = rs.scratch_ticket(get_db(), body.raffle_slug, body.folio, body.code)
     if not result.get("ok"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, result.get("message", "No se puede raspar"))
