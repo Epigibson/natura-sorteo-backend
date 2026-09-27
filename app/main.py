@@ -57,7 +57,7 @@ def create_app() -> FastAPI:
     app.include_router(staff.router)
     app.include_router(public.router)
 
-    @app.get("/health")
+    @app.api_route("/health", methods=["GET", "HEAD"])
     def health() -> dict:
         from app.db import get_client
 
