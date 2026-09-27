@@ -13,6 +13,7 @@ from app.db import get_db
 from app.schemas import (
     ChangePasswordIn,
     RaffleCreate,
+    RaffleUpdate,
     RaffleOut,
     RaffleStats,
     TicketAssign,
@@ -362,10 +363,10 @@ def export_participants(
 @router.patch("/raffles/{raffle_id}", response_model=RaffleOut)
 def update_raffle(
     raffle_id: str,
-    body: dict,
+    body: RaffleUpdate,
     user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> dict:
-    """Edita premio, fecha o notas de un sorteo (solo si no está sorteado)."""
+    """Edita un sorteo (solo si no está sorteado)."""
     from bson import ObjectId
     from datetime import datetime, timezone
 
@@ -377,16 +378,18 @@ def update_raffle(
         raise HTTPException(400, "No se puede editar un sorteo ya sorteado")
 
     allowed = {}
-    for field in ("prize", "prize_value", "draw_date", "notes", "title", "image_url"):
-        if field in body and body[field] is not None:
-            allowed[field] = body[field]
+    for field in ("title", "prize", "prize_value", "draw_date", "notes", "image_url", "max_tickets_per_person"):
+        val = getattr(body, field, None)
+        if val is not None:
+            allowed[field] = val
     if not allowed:
         raise HTTPException(400, "Nada que actualizar")
     allowed["updated_at"] = datetime.now(timezone.utc)
 
     db.raffles.update_one({"_id": doc["_id"]}, {"$set": allowed})
     from app.services import raffle_service as rs
-    return rs.get_raffle(db, raffle_id)
+    result = rs.get_raffle(db, raffle_id)
+    return result
 
 
 # ---------- Historial global de participantes ----------

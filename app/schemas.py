@@ -67,6 +67,16 @@ class RaffleCreate(BaseModel):
         return v
 
 
+class RaffleUpdate(BaseModel):
+    title: Optional[str] = None
+    prize: Optional[str] = None
+    prize_value: Optional[int] = None
+    draw_date: Optional[str] = None
+    notes: Optional[str] = None
+    image_url: Optional[str] = None
+    max_tickets_per_person: Optional[int] = None
+
+
 class RaffleOut(BaseModel):
     id: str
     slug: str
@@ -79,6 +89,8 @@ class RaffleOut(BaseModel):
     status: RaffleStatus
     draw_date: Optional[str] = None
     notes: Optional[str] = None
+    image_url: Optional[str] = None
+    max_tickets_per_person: Optional[int] = None
     created_at: datetime
     drawn_at: Optional[datetime] = None
     winner: Optional[dict] = None
