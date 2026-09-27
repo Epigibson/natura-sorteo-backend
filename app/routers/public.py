@@ -116,3 +116,64 @@ def scratch(body: ScratchIn) -> ScratchOut:
     if not result.get("ok"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, result.get("message", "No se puede raspar"))
     return ScratchOut(**result)
+
+
+@router.post("/raffles/{slug}/claim")
+def claim_ticket(slug: str, body: dict) -> dict:
+    """Reclamar un boleto libre: registra nombre+teléfono y asigna el folio.
+    Un teléfono = un boleto. No requiere código."""
+    folio = body.get("folio")
+    name = (body.get("name") or "").strip()
+    phone = "".join(c for c in (body.get("phone") or "") if c.isdigit())
+
+    if not folio or not isinstance(folio, int):
+        raise HTTPException(400, "Folio inválido")
+    if len(name) < 3:
+        raise HTTPException(400, "Escribe tu nombre completo")
+    if len(phone) < 10:
+        raise HTTPException(400, "Teléfono debe tener 10 dígitos")
+
+    from app.services import raffle_service as rs
+
+    db = get_db()
+    raffle = db.raffles.find_one({"slug": slug})
+    if not raffle:
+        raise HTTPException(404, "Sorteo no encontrado")
+    if raffle.get("status") != "open":
+        raise HTTPException(400, "El sorteo no está abierto")
+
+    ticket = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": folio})
+    if not ticket:
+        raise HTTPException(404, "Folio no encontrado")
+    if ticket["status"] != "free":
+        raise HTTPException(400, "Este boleto ya fue tomado")
+
+    # Un teléfono = un boleto
+    dup = db.tickets.find_one({
+        "raffle_id": raffle["_id"],
+        "participant.phone": phone,
+        "status": {"$in": ["registered", "scratched", "paid"]},
+    })
+    if dup:
+        raise HTTPException(400, f"Este teléfono ya tiene el folio {dup['folio']}")
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    db.tickets.update_one(
+        {"_id": ticket["_id"]},
+        {"$set": {
+            "status": "registered",
+            "participant": {"name": name, "phone": phone},
+            "registered_at": now,
+            "delivered_at": now,
+            "updated_at": now,
+        }},
+    )
+
+    return {
+        "ok": True,
+        "folio": folio,
+        "code": ticket["access_code"],
+        "message": f"Folio {folio} asignado a {name}",
+    }
