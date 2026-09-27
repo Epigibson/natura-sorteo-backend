@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import json
+from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -352,4 +354,127 @@ def export_participants(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+# ---------- Editar sorteo ----------
+@router.patch("/raffles/{raffle_id}", response_model=RaffleOut)
+def update_raffle(
+    raffle_id: str,
+    body: dict,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    """Edita premio, fecha o notas de un sorteo (solo si no está sorteado)."""
+    from bson import ObjectId
+    from datetime import datetime, timezone
+
+    db = get_db()
+    doc = db.raffles.find_one({"_id": ObjectId(raffle_id)})
+    if not doc:
+        raise HTTPException(404, "Sorteo no encontrado")
+    if doc.get("status") == "drawn":
+        raise HTTPException(400, "No se puede editar un sorteo ya sorteado")
+
+    allowed = {}
+    for field in ("prize", "prize_value", "draw_date", "notes", "title"):
+        if field in body and body[field] is not None:
+            allowed[field] = body[field]
+    if not allowed:
+        raise HTTPException(400, "Nada que actualizar")
+    allowed["updated_at"] = datetime.now(timezone.utc)
+
+    db.raffles.update_one({"_id": doc["_id"]}, {"$set": allowed})
+    from app.services import raffle_service as rs
+    return rs.get_raffle(db, raffle_id)
+
+
+# ---------- Historial global de participantes ----------
+@router.get("/participants")
+def list_participants(
+    user: Annotated[CurrentUser, Depends(require_staff)],
+) -> dict:
+    """Historial de participantes en todos los sorteos."""
+    from app.services import raffle_service as rs
+
+    db = get_db()
+    raffles = {str(r["_id"]): r for r in db.raffles.find()}
+    seen: dict[str, dict] = {}
+
+    for t in db.tickets.find({"participant.phone": {"$ne": None}}):
+        p = t.get("participant") or {}
+        phone = p.get("phone")
+        if not phone:
+            continue
+        rid = str(t["raffle_id"])
+        raffle = raffles.get(rid, {})
+        entry = seen.setdefault(phone, {
+            "name": p.get("name"),
+            "phone": phone,
+            "raffles": [],
+            "total_spent": 0,
+            "tickets_count": 0,
+        })
+        entry["raffles"].append({
+            "raffle": raffle.get("title", "?"),
+            "raffle_id": rid,
+            "folio": t["folio"],
+            "amount": t.get("amount"),
+            "status": t.get("status"),
+            "is_winner": t.get("is_winner", False),
+        })
+        entry["tickets_count"] += 1
+        if t.get("status") == "paid" and t.get("amount"):
+            entry["total_spent"] += t["amount"]
+
+    result = sorted(seen.values(), key=lambda x: x["total_spent"], reverse=True)
+    return {"participants": result, "total": len(result)}
+
+
+# ---------- Backup JSON ----------
+@router.get("/raffles/{raffle_id}/export/backup")
+def export_backup(
+    raffle_id: str,
+    user: Annotated[CurrentUser, Depends(require_staff)],
+) -> dict:
+    """Exporta todo el sorteo en JSON (sorteo + boletos + participantes)."""
+    import json
+    from fastapi.responses import StreamingResponse
+    from app.services import raffle_service as rs
+
+    db = get_db()
+    raffle = rs.get_raffle(db, raffle_id)
+    if not raffle:
+        raise HTTPException(404, "Sorteo no encontrado")
+    tickets = rs.list_tickets(db, raffle_id)
+    stats = rs.stats_sorteo(db, raffle_id)
+
+    # Serializar fechas a ISO
+    def serialize(obj):
+        if hasattr(obj, "isoformat"):
+            return obj.isoformat()
+        return obj
+
+    for t in tickets:
+        for k in ("delivered_at", "registered_at", "scratched_at", "paid_at", "updated_at", "created_at"):
+            if t.get(k):
+                t[k] = serialize(t[k])
+    for k in ("created_at", "drawn_at"):
+        if raffle.get(k):
+            raffle[k] = serialize(raffle[k])
+
+    data = {
+        "backup_version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "raffle": raffle,
+        "stats": stats,
+        "tickets": tickets,
+    }
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    buf = io.BytesIO(json_str.encode("utf-8"))
+    return StreamingResponse(
+        buf,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f"attachment; filename=backup-{raffle.get('slug', 'sorteo')}.json"
+        },
     )
