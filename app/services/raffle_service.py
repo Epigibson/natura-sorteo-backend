@@ -202,19 +202,20 @@ def entregar_boleto(
     if ticket["status"] == "paid":
         raise ValueError("El boleto ya está pagado y no se puede modificar")
 
-    # Un teléfono = un boleto
+    # Múltiples boletos permitidos (con límite opcional)
     if phone:
         phone_d = "".join(c for c in phone if c.isdigit())
-        dup = db.tickets.find_one(
-            {
+        raffle_doc = db.raffles.find_one({"_id": rid})
+        max_pp = (raffle_doc or {}).get("max_tickets_per_person", 0)
+        if max_pp > 0:
+            count = db.tickets.count_documents({
                 "raffle_id": rid,
                 "participant.phone": phone_d,
                 "status": {"$in": ["delivered", "registered", "scratched", "paid"]},
                 "folio": {"$ne": folio},
-            }
-        )
-        if dup:
-            raise ValueError(f"Ese teléfono ya tiene el folio {dup['folio']}")
+            })
+            if count >= max_pp:
+                raise ValueError(f"Ese teléfono ya tiene el máximo de {max_pp} boletos")
 
     update: dict[str, Any] = {
         "status": "delivered",
@@ -349,16 +350,17 @@ def register_participant(
         return {"ok": False, "message": "Este folio fue liberado"}
 
     phone_d = "".join(c for c in phone if c.isdigit())
-    dup = db.tickets.find_one(
-        {
+    # Múltiples boletos permitidos — solo verificar límite si está configurado
+    max_pp = raffle.get("max_tickets_per_person", 0)
+    if max_pp > 0:
+        count = db.tickets.count_documents({
             "raffle_id": raffle["_id"],
             "participant.phone": phone_d,
-            "status": {"$in": ["delivered", "registered", "scratched", "paid"]},
+            "status": {"$in": ["registered", "scratched", "paid"]},
             "folio": {"$ne": folio},
-        }
-    )
-    if dup:
-        return {"ok": False, "message": f"Ese teléfono ya tiene el folio {dup['folio']}"}
+        })
+        if count >= max_pp:
+            return {"ok": False, "message": f"Ese teléfono ya tiene el máximo de {max_pp} boletos"}
 
     new_status = "registered" if ticket["status"] in ("free", "delivered") else ticket["status"]
     db.tickets.update_one(
