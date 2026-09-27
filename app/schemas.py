@@ -176,6 +176,7 @@ class PublicRaffleOut(BaseModel):
     title: str
     prize: str
     prize_value: int
+    image_url: Optional[str] = None
     price_min: int
     price_max: int
     ticket_count: int

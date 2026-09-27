@@ -33,6 +33,7 @@ def public_raffle(slug: str) -> dict:
         "title": raffle["title"],
         "prize": raffle["prize"],
         "prize_value": raffle["prize_value"],
+        "image_url": raffle.get("image_url"),
         "price_min": raffle["price_min"],
         "price_max": raffle["price_max"],
         "ticket_count": raffle["ticket_count"],
