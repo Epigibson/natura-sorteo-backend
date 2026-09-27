@@ -523,3 +523,33 @@ async def upload_image(
         return {"url": result.get("secure_url"), "public_id": result.get("public_id")}
     except Exception as exc:
         raise HTTPException(500, f"Error al subir imagen: {exc}")
+
+# ---------- Eliminar sorteo (cascade) ----------
+@router.delete("/raffles/{raffle_id}")
+def delete_raffle(
+    raffle_id: str,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    """Elimina un sorteo y todos sus boletos (cascade)."""
+    from bson import ObjectId
+
+    db = get_db()
+    try:
+        rid = ObjectId(raffle_id)
+    except Exception:
+        raise HTTPException(400, "ID inválido")
+
+    raffle = db.raffles.find_one({"_id": rid})
+    if not raffle:
+        raise HTTPException(404, "Sorteo no encontrado")
+
+    # Eliminar boletos primero
+    tickets_result = db.tickets.delete_many({"raffle_id": rid})
+    # Eliminar sorteo
+    db.raffles.delete_one({"_id": rid})
+
+    return {
+        "ok": True,
+        "deleted_raffle": raffle.get("title"),
+        "deleted_tickets": tickets_result.deleted_count,
+    }
