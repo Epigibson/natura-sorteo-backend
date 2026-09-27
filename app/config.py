@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # CORS — Angular dev server
     cors_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
 
+    # Cloudinary (imágenes de productos)
+    cloudinary_cloud_name: str = ""
+    cloudinary_api_key: str = ""
+    cloudinary_api_secret: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

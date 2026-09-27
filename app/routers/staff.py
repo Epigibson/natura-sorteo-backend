@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app.db import get_db
@@ -478,3 +478,40 @@ def export_backup(
             "Content-Disposition": f"attachment; filename=backup-{raffle.get('slug', 'sorteo')}.json"
         },
     )
+
+# ---------- Upload imagen a Cloudinary ----------
+@router.post("/upload-image")
+async def upload_image(
+    file: UploadFile,
+    user: Annotated[CurrentUser, Depends(require_staff)],
+) -> dict:
+    """Sube una imagen a Cloudinary y devuelve la URL."""
+    import cloudinary
+    import cloudinary.uploader
+
+    from app.config import get_settings
+
+    s = get_settings()
+    if not s.cloudinary_cloud_name:
+        raise HTTPException(500, "Cloudinary no está configurado")
+
+    cloudinary.config(
+        cloud_name=s.cloudinary_cloud_name,
+        api_key=s.cloudinary_api_key,
+        api_secret=s.cloudinary_api_secret,
+        secure=True,
+    )
+
+    try:
+        content = await file.read()
+        import base64
+        b64 = base64.b64encode(content).decode("utf-8")
+        mime = file.content_type or "image/jpeg"
+        result = cloudinary.uploader.upload(
+            f"data:{mime};base64,{b64}",
+            folder="sorteo-natura",
+            resource_type="image",
+        )
+        return {"url": result.get("secure_url"), "public_id": result.get("public_id")}
+    except Exception as exc:
+        raise HTTPException(500, f"Error al subir imagen: {exc}")
