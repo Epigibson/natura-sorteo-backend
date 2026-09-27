@@ -206,11 +206,11 @@ def entregar_boleto(
     if ticket["status"] == "paid":
         raise ValueError("El boleto ya está pagado y no se puede modificar")
 
-    # Múltiples boletos permitidos (con límite opcional)
+    # Múltiples boletos permitidos (hasta max_tickets_per_person)
     if phone:
         phone_d = "".join(c for c in phone if c.isdigit())
         raffle_doc = db.raffles.find_one({"_id": rid})
-        max_pp = (raffle_doc or {}).get("max_tickets_per_person", 0)
+        max_pp = (raffle_doc or {}).get("max_tickets_per_person", 3)
         if max_pp > 0:
             count = db.tickets.count_documents({
                 "raffle_id": rid,
@@ -356,8 +356,8 @@ def register_participant(
         return {"ok": False, "message": "Este folio fue liberado"}
 
     phone_d = "".join(c for c in phone if c.isdigit())
-    # Múltiples boletos permitidos — solo verificar límite si está configurado
-    max_pp = raffle.get("max_tickets_per_person", 0)
+    # Múltiples boletos permitidos (hasta max_tickets_per_person)
+    max_pp = raffle.get("max_tickets_per_person", 3)
     if max_pp > 0:
         count = db.tickets.count_documents({
             "raffle_id": raffle["_id"],

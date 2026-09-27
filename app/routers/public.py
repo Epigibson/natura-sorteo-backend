@@ -163,17 +163,7 @@ def claim_ticket(slug: str, body: dict) -> dict:
     if ticket["status"] != "free":
         raise HTTPException(400, "Este boleto ya fue tomado")
 
-    # ANTITRAMPA 1: si ya raspó un boleto, no puede reclamar más
-    # (evita que raspe, vea el precio caro, y reclame otro buscando el barato)
-    scratched = db.tickets.find_one({
-        "raffle_id": raffle["_id"],
-        "participant.phone": phone,
-        "status": {"$in": ["scratched", "paid"]},
-    })
-    if scratched:
-        raise HTTPException(400, f"Ya raspaste el boleto {scratched['folio']}. Primero reclama todos tus boletos, luego ráspalos.")
-
-    # ANTITRAMPA 2: límite de boletos por persona (solo cuenta los NO raspados como disponibles)
+    # Límite de boletos por persona (independientemente de si ya raspó)
     max_pp = raffle.get("max_tickets_per_person", 3)  # default 3
     count = db.tickets.count_documents({
         "raffle_id": raffle["_id"],
