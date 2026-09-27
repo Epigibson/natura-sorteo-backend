@@ -28,6 +28,23 @@ def seed_admin(db) -> None:
     print(f"[seed] admin creado: {get_settings().seed_admin_phone} / {get_settings().seed_admin_password}")
 
 
+async def _auto_close_loop():
+    """Cierra sorteos automáticamente cuando llega la fecha del sorteo."""
+    while True:
+        try:
+            from datetime import datetime, timezone
+            db = get_db()
+            now = datetime.now(timezone.utc)
+            # Cerrar sorteos abiertos cuya fecha ya pasó
+            db.raffles.update_many(
+                {"status": "open", "draw_date": {"$ne": None, "$lte": now.strftime("%Y-%m-%d")}},
+                {"$set": {"status": "closed"}},
+            )
+        except Exception as exc:
+            print(f"[auto-close] error: {exc}")
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
@@ -35,7 +52,9 @@ async def lifespan(_: FastAPI):
         seed_admin(get_db())
     except Exception as exc:
         print(f"[startup] MongoDB no disponible: {exc}")
+    task = asyncio.create_task(_auto_close_loop())
     yield
+    task.cancel()
 
 
 def create_app() -> FastAPI:

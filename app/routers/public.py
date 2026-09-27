@@ -206,4 +206,5 @@ def claim_ticket(slug: str, body: dict) -> dict:
         "folio": folio,
         "code": ticket["access_code"],
         "message": f"Folio {folio} asignado a {name}",
+        "notify": True,
     }
