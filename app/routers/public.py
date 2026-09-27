@@ -222,3 +222,44 @@ def claim_ticket(slug: str, body: dict) -> dict:
         "message": f"Folio {folio} asignado a {name}",
         "notify": True,
     }
+
+@router.post("/raffles/{slug}/release")
+def release_ticket(slug: str, body: dict) -> dict:
+    """Liberar un boleto reclamado (solo si no ha sido raspado)."""
+    folio = body.get("folio")
+    phone = "".join(ch for ch in (body.get("phone") or "") if ch.isdigit())
+    if not folio or not phone:
+        raise HTTPException(400, "Folio y teléfono requeridos")
+
+    db = get_db()
+    raffle = db.raffles.find_one({"slug": slug})
+    if not raffle:
+        raise HTTPException(404, "Sorteo no encontrado")
+
+    ticket = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": folio})
+    if not ticket:
+        raise HTTPException(404, "Folio no encontrado")
+
+    p = ticket.get("participant") or {}
+    if p.get("phone") != phone:
+        raise HTTPException(403, "Este boleto no te pertenece")
+    if ticket["status"] in ("scratched", "paid"):
+        raise HTTPException(400, "No se puede liberar un boleto ya raspado o pagado")
+
+    import secrets
+    new_code = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(4))
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    db.tickets.update_one(
+        {"_id": ticket["_id"]},
+        {"$set": {
+            "status": "free",
+            "participant": None,
+            "delivered_at": None,
+            "registered_at": None,
+            "access_code": new_code,
+            "updated_at": now,
+        }},
+    )
+    return {"ok": True, "folio": folio, "message": "Boleto liberado"}
