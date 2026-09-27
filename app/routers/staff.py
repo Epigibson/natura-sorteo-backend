@@ -376,7 +376,7 @@ def update_raffle(
         raise HTTPException(400, "No se puede editar un sorteo ya sorteado")
 
     allowed = {}
-    for field in ("prize", "prize_value", "draw_date", "notes", "title"):
+    for field in ("prize", "prize_value", "draw_date", "notes", "title", "image_url"):
         if field in body and body[field] is not None:
             allowed[field] = body[field]
     if not allowed:

@@ -79,6 +79,7 @@ def crear_sorteo(
         "slug": slug,
         "title": title.strip(),
         "prize": prize.strip(),
+        "image_url": None,
         "prize_value": int(prize_value),
         "price_min": int(price_min),
         "price_max": int(price_max),
