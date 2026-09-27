@@ -23,8 +23,8 @@ class Settings(BaseSettings):
     refresh_ttl_days: int = 14
 
     # Seed admin (dev bootstrap — cambiar en producción)
-    seed_admin_phone: str = "5500000000"
-    seed_admin_password: str = "AdminDev123!"
+    seed_admin_phone: str = "4461445984"
+    seed_admin_password: str = "Yuri183c97abril"
     seed_admin_name: str = "Yuri"
 
     # CORS — Angular dev server
