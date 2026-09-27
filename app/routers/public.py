@@ -171,9 +171,9 @@ def claim_ticket(slug: str, body: dict) -> dict:
         "status": {"$in": ["scratched", "paid"]},
     })
     if scratched:
-        raise HTTPException(400, f"Ya raspaste tu boleto {scratched['folio']}. No puedes reclamar otro después de raspar.")
+        raise HTTPException(400, f"Ya raspaste el boleto {scratched['folio']}. Primero reclama todos tus boletos, luego ráspalos.")
 
-    # ANTITRAMPA 2: límite de boletos por persona
+    # ANTITRAMPA 2: límite de boletos por persona (solo cuenta los NO raspados como disponibles)
     max_pp = raffle.get("max_tickets_per_person", 3)  # default 3
     count = db.tickets.count_documents({
         "raffle_id": raffle["_id"],
