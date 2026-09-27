@@ -57,6 +57,7 @@ class RaffleCreate(BaseModel):
     price_max: int = Field(ge=1, description="Monto máximo del boleto (MXN)")
     draw_date: Optional[str] = None
     notes: Optional[str] = None
+    max_tickets_per_person: int = Field(default=3, ge=0, description="0 = sin límite")
 
     @field_validator("price_max")
     @classmethod

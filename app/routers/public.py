@@ -149,22 +149,45 @@ def claim_ticket(slug: str, body: dict) -> dict:
     if ticket["status"] != "free":
         raise HTTPException(400, "Este boleto ya fue tomado")
 
-    # Verificar límite de boletos por persona (max_tickets_per_person)
-    max_pp = raffle.get("max_tickets_per_person", 0)  # 0 = sin límite
-    if max_pp > 0:
-        count = db.tickets.count_documents({
-            "raffle_id": raffle["_id"],
-            "participant.phone": phone,
-            "status": {"$in": ["registered", "scratched", "paid"]},
-        })
-        if count >= max_pp:
-            raise HTTPException(400, f"Este teléfono ya tiene el máximo de {max_pp} boletos")
+    # ANTITRAMPA 1: si ya raspó un boleto, no puede reclamar más
+    # (evita que raspe, vea el precio caro, y reclame otro buscando el barato)
+    scratched = db.tickets.find_one({
+        "raffle_id": raffle["_id"],
+        "participant.phone": phone,
+        "status": {"$in": ["scratched", "paid"]},
+    })
+    if scratched:
+        raise HTTPException(400, f"Ya raspaste tu boleto {scratched['folio']}. No puedes reclamar otro después de raspar.")
 
+    # ANTITRAMPA 2: límite de boletos por persona
+    max_pp = raffle.get("max_tickets_per_person", 3)  # default 3
+    count = db.tickets.count_documents({
+        "raffle_id": raffle["_id"],
+        "participant.phone": phone,
+        "status": {"$in": ["registered", "scratched", "paid"]},
+    })
+    if count >= max_pp:
+        raise HTTPException(400, f"Este teléfono ya tiene el máximo de {max_pp} boletos")
+
+    # ANTITRAMPA 3: rate limit — máximo 5 claims por minuto por IP
+    import time
+    global _claim_rate
+    try:
+        _claim_rate
+    except NameError:
+        _claim_rate = {}
+    ip = "default"
+    now = time.time()
+    _claim_rate[ip] = [t for t in _claim_rate.get(ip, []) if now - t < 60]
+    if len(_claim_rate[ip]) >= 5:
+        raise HTTPException(429, "Demasiados intentos. Espera un minuto.")
+    _claim_rate[ip].append(now)
+
+    # ANTITRAMPA 4: atomic claim — solo si sigue libre (evita race condition)
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
-
-    db.tickets.update_one(
-        {"_id": ticket["_id"]},
+    result = db.tickets.update_one(
+        {"_id": ticket["_id"], "status": "free"},
         {"$set": {
             "status": "registered",
             "participant": {"name": name, "phone": phone},
@@ -173,6 +196,10 @@ def claim_ticket(slug: str, body: dict) -> dict:
             "updated_at": now,
         }},
     )
+    if result.modified_count == 0:
+        raise HTTPException(400, "Este boleto fue tomado por otra persona")
+
+
 
     return {
         "ok": True,

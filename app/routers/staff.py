@@ -85,6 +85,7 @@ def create_raffle(
             price_max=body.price_max,
             draw_date=body.draw_date,
             notes=body.notes,
+            max_tickets_per_person=body.max_tickets_per_person,
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))

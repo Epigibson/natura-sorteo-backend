@@ -56,6 +56,7 @@ def crear_sorteo(
     price_max: int,
     draw_date: str | None = None,
     notes: str | None = None,
+    max_tickets_per_person: int = 3,
 ) -> dict:
     """Crea el sorteo y genera boletos únicos de price_min..price_max."""
     if price_max < price_min:
@@ -87,6 +88,7 @@ def crear_sorteo(
         "status": "open",
         "draw_date": draw_date,
         "notes": notes,
+        "max_tickets_per_person": max_tickets_per_person,
         "created_at": now_utc(),
         "drawn_at": None,
         "winner": None,
@@ -268,6 +270,8 @@ def liberar_boleto(db: Database, raffle_id: str, folio: int) -> dict | None:
         return None
     if ticket["status"] == "paid":
         raise ValueError("No se puede liberar un boleto pagado")
+    if ticket["status"] == "scratched":
+        raise ValueError("No se puede liberar un boleto ya raspado — el precio ya fue revelado")
 
     doc = db.tickets.find_one_and_update(
         {"_id": ticket["_id"]},
