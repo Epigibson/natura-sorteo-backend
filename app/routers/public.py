@@ -73,7 +73,7 @@ def public_board(slug: str) -> dict:
             {
                 "folio": t["folio"],
                 "status": t.get("status", "free"),
-                "has_name": bool(p.get("name")),  # solo para admin
+                
             }
         )
 
