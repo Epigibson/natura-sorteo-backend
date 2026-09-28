@@ -86,6 +86,7 @@ def create_raffle(
             price_max=body.price_max,
             draw_date=body.draw_date,
             notes=body.notes,
+            meet_url=body.meet_url,
             max_tickets_per_person=body.max_tickets_per_person,
         )
     except ValueError as exc:
@@ -378,7 +379,7 @@ def update_raffle(
         raise HTTPException(400, "No se puede editar un sorteo ya sorteado")
 
     allowed = {}
-    for field in ("title", "prize", "prize_value", "draw_date", "notes", "image_url", "max_tickets_per_person"):
+    for field in ("title", "prize", "prize_value", "draw_date", "notes", "image_url", "meet_url", "max_tickets_per_person"):
         val = getattr(body, field, None)
         if val is not None:
             allowed[field] = val

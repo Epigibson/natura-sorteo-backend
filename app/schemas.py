@@ -57,6 +57,7 @@ class RaffleCreate(BaseModel):
     price_max: int = Field(ge=1, description="Monto máximo del boleto (MXN)")
     draw_date: Optional[str] = None
     notes: Optional[str] = None
+    meet_url: Optional[str] = None
     max_tickets_per_person: int = Field(default=3, ge=0, description="0 = sin límite")
 
     @field_validator("price_max")
@@ -74,6 +75,7 @@ class RaffleUpdate(BaseModel):
     draw_date: Optional[str] = None
     notes: Optional[str] = None
     image_url: Optional[str] = None
+    meet_url: Optional[str] = None
     max_tickets_per_person: Optional[int] = None
 
 
@@ -90,6 +92,7 @@ class RaffleOut(BaseModel):
     draw_date: Optional[str] = None
     notes: Optional[str] = None
     image_url: Optional[str] = None
+    meet_url: Optional[str] = None
     max_tickets_per_person: Optional[int] = None
     created_at: datetime
     drawn_at: Optional[datetime] = None
@@ -190,6 +193,7 @@ class PublicRaffleOut(BaseModel):
     prize: str
     prize_value: int
     image_url: Optional[str] = None
+    meet_url: Optional[str] = None
     price_min: int
     price_max: int
     ticket_count: int

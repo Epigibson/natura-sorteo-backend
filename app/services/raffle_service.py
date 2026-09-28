@@ -57,6 +57,7 @@ def crear_sorteo(
     price_max: int,
     draw_date: str | None = None,
     notes: str | None = None,
+    meet_url: str | None = None,
     max_tickets_per_person: int = 3,
 ) -> dict:
     """Crea el sorteo y genera boletos únicos de price_min..price_max."""
@@ -90,6 +91,7 @@ def crear_sorteo(
         "status": "open",
         "draw_date": draw_date,
         "notes": notes,
+        "meet_url": meet_url,
         "max_tickets_per_person": max_tickets_per_person,
         "created_at": now_utc(),
         "drawn_at": None,
