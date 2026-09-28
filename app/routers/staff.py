@@ -370,6 +370,7 @@ def update_raffle(
     """Edita un sorteo (solo si no está sorteado)."""
     from bson import ObjectId
     from datetime import datetime, timezone
+    from app.services import raffle_service as rs
 
     db = get_db()
     doc = db.raffles.find_one({"_id": ObjectId(raffle_id)})
@@ -390,7 +391,6 @@ def update_raffle(
     allowed["updated_at"] = datetime.now(timezone.utc)
 
     db.raffles.update_one({"_id": doc["_id"]}, {"$set": allowed})
-    from app.services import raffle_service as rs
     result = rs.get_raffle(db, raffle_id)
     return result
 
