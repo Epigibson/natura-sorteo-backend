@@ -39,6 +39,24 @@ def generar_codigo(longitud: int = 4) -> str:
     return "".join(secrets.choice(_ALFABETO) for _ in range(longitud))
 
 
+def normalize_meet_url(url: str | None) -> str | None:
+    """Normaliza enlace de videollamada: fuerza https y limpia espacios."""
+    v = (url or "").strip()
+    if not v:
+        return None
+    if v.lower().startswith("http://"):
+        v = "https://" + v[7:]
+    elif not v.lower().startswith("https://"):
+        v = "https://" + v.lstrip("/")
+    return v
+
+
+def default_meet_url() -> str:
+    from app.config import get_settings
+
+    return normalize_meet_url(get_settings().default_meet_url) or ""
+
+
 def _next_folio_codes(n: int) -> list[str]:
     """n códigos únicos de 4 caracteres."""
     codigos: set[str] = set()
@@ -91,7 +109,7 @@ def crear_sorteo(
         "status": "open",
         "draw_date": draw_date,
         "notes": notes,
-        "meet_url": meet_url,
+        "meet_url": normalize_meet_url(meet_url) or default_meet_url() or None,
         "max_tickets_per_person": max_tickets_per_person,
         "created_at": now_utc(),
         "drawn_at": None,

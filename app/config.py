@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     cloudinary_api_key: str = ""
     cloudinary_api_secret: str = ""
 
+    # Enlace de videollamada reutilizable (la misma sala para todos los sorteos)
+    default_meet_url: str = "https://meet.google.com/hea-kbvn-hja"
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -45,7 +45,7 @@ def public_raffle(slug: str) -> dict:
         "prize": raffle["prize"],
         "prize_value": raffle["prize_value"],
         "image_url": raffle.get("image_url"),
-        "meet_url": raffle.get("meet_url"),
+        "meet_url": raffle.get("meet_url") or rs.default_meet_url() or None,
         "price_min": raffle["price_min"],
         "price_max": raffle["price_max"],
         "ticket_count": raffle["ticket_count"],

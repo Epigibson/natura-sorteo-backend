@@ -382,6 +382,8 @@ def update_raffle(
     for field in ("title", "prize", "prize_value", "draw_date", "notes", "image_url", "meet_url", "max_tickets_per_person"):
         val = getattr(body, field, None)
         if val is not None:
+            if field == "meet_url":
+                val = rs.normalize_meet_url(val)
             allowed[field] = val
     if not allowed:
         raise HTTPException(400, "Nada que actualizar")
