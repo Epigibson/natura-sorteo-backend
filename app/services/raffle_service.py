@@ -292,8 +292,6 @@ def liberar_boleto(db: Database, raffle_id: str, folio: int) -> dict | None:
         return None
     if ticket["status"] == "paid":
         raise ValueError("No se puede liberar un boleto pagado")
-    if ticket["status"] == "scratched":
-        raise ValueError("No se puede liberar un boleto ya raspado — el precio ya fue revelado")
 
     doc = db.tickets.find_one_and_update(
         {"_id": ticket["_id"]},
