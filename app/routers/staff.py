@@ -19,8 +19,15 @@ from app.schemas import (
     TicketAssign,
     TicketOut,
     TicketPaidIn,
+    TicketUnpayIn,
 )
-from app.security import CurrentUser, require_admin, require_staff
+from app.security import (
+    CurrentUser,
+    create_access_token,
+    create_refresh_token,
+    require_admin,
+    require_staff,
+)
 from app.services import raffle_service as rs
 
 router = APIRouter(prefix="/api/v1", tags=["staff"])
@@ -58,11 +65,21 @@ def change_password(
             "La nueva contraseña debe ser diferente a la actual",
         )
 
-    db.users.update_one(
+    # $inc de token_version invalida todas las sesiones anteriores (otros dispositivos, tokens robados)
+    new = db.users.find_one_and_update(
         {"_id": doc["_id"]},
-        {"$set": {"password_hash": hash_password(body.new_password)}},
+        {"$set": {"password_hash": hash_password(body.new_password)}, "$inc": {"token_version": 1}},
+        return_document=True,
     )
-    return {"ok": True, "message": "Contraseña actualizada correctamente"}
+    tv = new.get("token_version", 0)
+    rs.audit(db, "change_password", by=user["sub"])
+    # Tokens nuevos para que quien cambia la contraseña no pierda su propia sesión
+    return {
+        "ok": True,
+        "message": "Contraseña actualizada correctamente",
+        "access_token": create_access_token(sub=user["sub"], role=new.get("role", "collab"), name=new.get("name", ""), tv=tv),
+        "refresh_token": create_refresh_token(sub=user["sub"], role=new.get("role", "collab"), tv=tv),
+    }
 
 
 # ---------- Sorteos ----------
@@ -149,7 +166,24 @@ def mark_paid(
     user: Annotated[CurrentUser, Depends(require_staff)],
 ) -> dict:
     try:
-        doc = rs.marcar_pagado(get_db(), raffle_id, folio, body.note)
+        doc = rs.marcar_pagado(get_db(), raffle_id, folio, body.note, by=user["sub"])
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    if not doc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Boleto no encontrado")
+    return doc
+
+
+@router.post("/raffles/{raffle_id}/tickets/{folio}/unpay", response_model=TicketOut)
+def unmark_paid(
+    raffle_id: str,
+    folio: int,
+    body: TicketUnpayIn,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    """Deshace un pago marcado por error (solo admin y antes del sorteo)."""
+    try:
+        doc = rs.desmarcar_pago(get_db(), raffle_id, folio, by=user["sub"], reason=body.reason)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if not doc:
@@ -164,7 +198,7 @@ def release_ticket(
     user: Annotated[CurrentUser, Depends(require_staff)],
 ) -> dict:
     try:
-        doc = rs.liberar_boleto(get_db(), raffle_id, folio)
+        doc = rs.liberar_boleto(get_db(), raffle_id, folio, by=user["sub"])
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if not doc:
@@ -178,7 +212,7 @@ def close_raffle(
     user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> dict:
     try:
-        return rs.close_raffle(get_db(), raffle_id)
+        return rs.close_raffle(get_db(), raffle_id, by=user["sub"])
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 
@@ -189,12 +223,18 @@ def draw(
     user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> dict:
     try:
-        return rs.run_draw(get_db(), raffle_id)
+        return rs.run_draw(get_db(), raffle_id, by=user["sub"])
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 
 
 # ---------- Exportación Excel ----------
+def _text_cell(cell) -> None:
+    """Evita inyección de fórmulas: openpyxl trata '=...' como fórmula; lo forzamos a texto."""
+    if isinstance(cell.value, str) and cell.value.startswith("="):
+        cell.data_type = "s"
+
+
 @router.get("/raffles/{raffle_id}/export/participants")
 def export_participants(
     raffle_id: str,
@@ -286,6 +326,7 @@ def export_participants(
         ]
         for col, v in enumerate(values, 1):
             cell = ws.cell(row=row, column=col, value=v)
+            _text_cell(cell)
             cell.border = thin_border
             if col == 4 and isinstance(v, (int, float)):
                 cell.number_format = money_fmt
@@ -373,7 +414,10 @@ def update_raffle(
     from app.services import raffle_service as rs
 
     db = get_db()
-    doc = db.raffles.find_one({"_id": ObjectId(raffle_id)})
+    try:
+        doc = db.raffles.find_one({"_id": ObjectId(raffle_id)})
+    except Exception:
+        raise HTTPException(400, "ID inválido")
     if not doc:
         raise HTTPException(404, "Sorteo no encontrado")
     if doc.get("status") == "drawn":
@@ -514,10 +558,13 @@ async def upload_image(
     if file.content_type not in allowed_types:
         raise HTTPException(400, "Solo se permiten imágenes JPG, PNG, WebP o GIF")
 
+    content = await file.read(5 * 1024 * 1024 + 1)
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Imagen muy grande (máx 5 MB)")
+    # Verificar la firma real del archivo, no solo el content-type declarado
+    if not (content.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8")) or (content[:4] == b"RIFF" and content[8:12] == b"WEBP")):
+        raise HTTPException(400, "El archivo no parece una imagen válida")
     try:
-        content = await file.read()
-        if len(content) > 5 * 1024 * 1024:
-            raise HTTPException(400, "Imagen muy grande (máx 5 MB)")
         import base64
         b64 = base64.b64encode(content).decode("utf-8")
         mime = file.content_type or "image/jpeg"
@@ -549,10 +596,18 @@ def delete_raffle(
     if not raffle:
         raise HTTPException(404, "Sorteo no encontrado")
 
+    if raffle.get("status") == "drawn" or db.tickets.count_documents({"raffle_id": rid, "status": "paid"}) > 0:
+        raise HTTPException(
+            400,
+            "No se puede eliminar un sorteo con boletos pagados o ya sorteado. "
+            "Descarga el respaldo y pide a soporte borrarlo manualmente si es necesario.",
+        )
+
     # Eliminar boletos primero
     tickets_result = db.tickets.delete_many({"raffle_id": rid})
     # Eliminar sorteo
     db.raffles.delete_one({"_id": rid})
+    rs.audit(db, "delete_raffle", by=user["sub"], raffle_id=rid, title=raffle.get("title"), tickets=tickets_result.deleted_count)
 
     return {
         "ok": True,

@@ -28,6 +28,44 @@ def oid(value: str) -> ObjectId:
         raise ValueError("id inválido")
 
 
+def digits(value: str | None) -> str:
+    return "".join(c for c in (value or "") if c.isdigit())
+
+
+# Estados que ocupan cupo del límite por persona
+_STATUS_CUPO = ["delivered", "registered", "scratched", "paid"]
+
+
+def count_tickets_of_phone(db: Database, rid: ObjectId, phone: str, exclude_folio: int | None = None) -> int:
+    q: dict[str, Any] = {"raffle_id": rid, "participant.phone": phone, "status": {"$in": _STATUS_CUPO}}
+    if exclude_folio is not None:
+        q["folio"] = {"$ne": exclude_folio}
+    return db.tickets.count_documents(q)
+
+
+def audit(db: Database, action: str, *, by: str | None = None, raffle_id: Any = None, folio: int | None = None, **extra: Any) -> None:
+    """Bitácora de acciones sensibles (pagos, sorteo, liberaciones, borrados)."""
+    try:
+        db.audit_log.insert_one({
+            "at": now_utc(), "action": action, "by": by,
+            "raffle_id": str(raffle_id) if raffle_id else None, "folio": folio, **extra,
+        })
+    except Exception as exc:  # la bitácora nunca debe tumbar la operación
+        print(f"[audit] error: {exc}")
+
+
+def _raffle_of(db: Database, rid: ObjectId) -> dict:
+    raffle = db.raffles.find_one({"_id": rid})
+    if not raffle:
+        raise ValueError("Sorteo no encontrado")
+    return raffle
+
+
+def _ensure_not_drawn(raffle: dict) -> None:
+    if raffle.get("status") == "drawn":
+        raise ValueError("El sorteo ya fue realizado; no se pueden hacer cambios en los boletos")
+
+
 def slugify(texto: str) -> str:
     text = unicodedata.normalize("NFKD", texto or "")
     text = text.encode("ascii", "ignore").decode("ascii")
@@ -220,81 +258,105 @@ def entregar_boleto(
 ) -> dict | None:
     """Marca el boleto como entregado (y opcionalmente precarga participante)."""
     rid = oid(raffle_id)
+    raffle = _raffle_of(db, rid)
+    _ensure_not_drawn(raffle)
     ticket = db.tickets.find_one({"raffle_id": rid, "folio": folio})
     if not ticket:
         return None
     if ticket["status"] == "paid":
         raise ValueError("El boleto ya está pagado y no se puede modificar")
 
-    # Múltiples boletos permitidos (hasta max_tickets_per_person)
-    if phone:
-        phone_d = "".join(c for c in phone if c.isdigit())
-        raffle_doc = db.raffles.find_one({"_id": rid})
-        max_pp = (raffle_doc or {}).get("max_tickets_per_person", 3)
-        if max_pp > 0:
-            count = db.tickets.count_documents({
-                "raffle_id": rid,
-                "participant.phone": phone_d,
-                "status": {"$in": ["delivered", "registered", "scratched", "paid"]},
-                "folio": {"$ne": folio},
-            })
-            if count >= max_pp:
-                raise ValueError(f"Ese teléfono ya tiene el máximo de {max_pp} boletos")
+    phone_d = digits(phone)
+    current = ticket.get("participant") or {}
+    # No pisar a otra persona que ya tiene el boleto: primero hay que liberarlo
+    if current.get("phone") and phone_d and current["phone"] != phone_d:
+        raise ValueError("Este boleto ya pertenece a otra persona; libéralo primero")
+    if (name or phone) and not (name and phone_d):
+        raise ValueError("Para entregar a alguien se necesitan nombre y teléfono")
 
-    update: dict[str, Any] = {
-        "status": "delivered",
-        "updated_at": now_utc(),
-        "delivered_at": ticket.get("delivered_at") or now_utc(),
-    }
-    if name and phone:
-        update["participant"] = {
-            "name": name.strip(),
-            "phone": "".join(c for c in phone if c.isdigit()),
-        }
-    elif ticket.get("participant") is None and (name or phone):
-        update["participant"] = {"name": (name or "").strip() or None, "phone": phone}
+    if phone_d:
+        max_pp = raffle.get("max_tickets_per_person", 3)
+        if max_pp and max_pp > 0 and count_tickets_of_phone(db, rid, phone_d, folio) >= max_pp:
+            raise ValueError(f"Ese teléfono ya tiene el máximo de {max_pp} boletos")
+
+    update: dict[str, Any] = {"updated_at": now_utc()}
+    # No degradar el estado de un boleto ya registrado/raspado
+    if ticket["status"] in ("free", "delivered"):
+        update["status"] = "delivered"
+        update["delivered_at"] = ticket.get("delivered_at") or now_utc()
+    if name and phone_d:
+        update["participant"] = {"name": name.strip(), "phone": phone_d}
 
     doc = db.tickets.find_one_and_update(
-        {"_id": ticket["_id"]},
+        {"_id": ticket["_id"], "status": {"$ne": "paid"}},
         {"$set": update},
         return_document=ReturnDocument.AFTER,
     )
+    if not doc:
+        raise ValueError("El boleto cambió mientras se procesaba; intenta de nuevo")
     return _serialize_ticket(doc)
 
 
-def marcar_pagado(db: Database, raffle_id: str, folio: int, note: str | None = None) -> dict | None:
+def marcar_pagado(
+    db: Database, raffle_id: str, folio: int, note: str | None = None, by: str | None = None
+) -> dict | None:
     rid = oid(raffle_id)
+    _ensure_not_drawn(_raffle_of(db, rid))
     ticket = db.tickets.find_one({"raffle_id": rid, "folio": folio})
     if not ticket:
         return None
     if ticket["status"] not in ("delivered", "registered", "scratched"):
         raise ValueError(f"No se puede marcar como pagado desde el estado '{ticket['status']}'")
+    p = ticket.get("participant") or {}
+    if not p.get("name") or not p.get("phone"):
+        raise ValueError("El boleto no tiene participante (nombre y teléfono); regístralo antes de cobrar")
 
+    now = now_utc()
     doc = db.tickets.find_one_and_update(
-        {"_id": ticket["_id"]},
-        {
-            "$set": {
-                "status": "paid",
-                "paid_at": now_utc(),
-                "updated_at": now_utc(),
-                "payment_note": note,
-            }
-        },
+        # el filtro de estado evita pisar un cambio concurrente (p. ej. auto-liberado)
+        {"_id": ticket["_id"], "status": {"$in": ["delivered", "registered", "scratched"]}},
+        {"$set": {"status": "paid", "paid_at": now, "updated_at": now, "payment_note": note, "paid_by": by}},
         return_document=ReturnDocument.AFTER,
     )
+    if not doc:
+        raise ValueError("El boleto cambió mientras se procesaba; revisa su estado")
+    audit(db, "pay", by=by, raffle_id=rid, folio=folio, amount=ticket.get("amount"), note=note)
     return _serialize_ticket(doc)
 
 
-def liberar_boleto(db: Database, raffle_id: str, folio: int) -> dict | None:
+def desmarcar_pago(db: Database, raffle_id: str, folio: int, by: str | None = None, reason: str | None = None) -> dict | None:
+    """Deshace un 'pagado' marcado por error (solo antes del sorteo). Vuelve a 'registered'/'delivered'."""
     rid = oid(raffle_id)
+    _ensure_not_drawn(_raffle_of(db, rid))
+    ticket = db.tickets.find_one({"raffle_id": rid, "folio": folio})
+    if not ticket:
+        return None
+    if ticket["status"] != "paid":
+        raise ValueError("El boleto no está marcado como pagado")
+    back = "scratched" if ticket.get("scratched_at") else ("registered" if ticket.get("registered_at") else "delivered")
+    doc = db.tickets.find_one_and_update(
+        {"_id": ticket["_id"], "status": "paid"},
+        {"$set": {"status": back, "paid_at": None, "paid_by": None, "updated_at": now_utc()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not doc:
+        raise ValueError("El boleto cambió mientras se procesaba; revisa su estado")
+    audit(db, "unpay", by=by, raffle_id=rid, folio=folio, reason=reason)
+    return _serialize_ticket(doc)
+
+
+def liberar_boleto(db: Database, raffle_id: str, folio: int, by: str | None = None) -> dict | None:
+    rid = oid(raffle_id)
+    _ensure_not_drawn(_raffle_of(db, rid))
     ticket = db.tickets.find_one({"raffle_id": rid, "folio": folio})
     if not ticket:
         return None
     if ticket["status"] == "paid":
         raise ValueError("No se puede liberar un boleto pagado")
 
+    # Una sola operación atómica: libera y rota el código
     doc = db.tickets.find_one_and_update(
-        {"_id": ticket["_id"]},
+        {"_id": ticket["_id"], "status": {"$ne": "paid"}},
         {
             "$set": {
                 "status": "free",
@@ -302,19 +364,16 @@ def liberar_boleto(db: Database, raffle_id: str, folio: int) -> dict | None:
                 "delivered_at": None,
                 "registered_at": None,
                 "scratched_at": None,
+                "access_code": generar_codigo(4),
                 "updated_at": now_utc(),
             },
             "$inc": {"code_rotation": 1},
         },
         return_document=ReturnDocument.AFTER,
     )
-    # Rotar código al liberar
-    nuevo_cod = generar_codigo(4)
-    doc = db.tickets.find_one_and_update(
-        {"_id": ticket["_id"]},
-        {"$set": {"access_code": nuevo_cod, "updated_at": now_utc()}},
-        return_document=ReturnDocument.AFTER,
-    )
+    if not doc:
+        raise ValueError("El boleto se pagó mientras se procesaba; no se liberó")
+    audit(db, "release", by=by, raffle_id=rid, folio=folio, previous=ticket.get("participant"), previous_status=ticket["status"])
     return _serialize_ticket(doc)
 
 
@@ -373,22 +432,24 @@ def register_participant(
     if ticket["status"] == "released":
         return {"ok": False, "message": "Este folio fue liberado"}
 
-    phone_d = "".join(c for c in phone if c.isdigit())
-    # Múltiples boletos permitidos (hasta max_tickets_per_person)
+    if raffle.get("status") == "drawn":
+        return {"ok": False, "message": "El sorteo ya fue realizado"}
+    if raffle.get("status") != "open" and ticket["status"] == "free":
+        return {"ok": False, "message": "La venta de este sorteo ya está cerrada"}
+
+    phone_d = digits(phone)
+    # Múltiples boletos permitidos (hasta max_tickets_per_person; 0 = sin límite)
     max_pp = raffle.get("max_tickets_per_person", 3)
-    if max_pp > 0:
-        count = db.tickets.count_documents({
-            "raffle_id": raffle["_id"],
-            "participant.phone": phone_d,
-            "status": {"$in": ["registered", "scratched", "paid"]},
-            "folio": {"$ne": folio},
-        })
-        if count >= max_pp:
-            return {"ok": False, "message": f"Ese teléfono ya tiene el máximo de {max_pp} boletos"}
+    if max_pp and max_pp > 0 and count_tickets_of_phone(db, raffle["_id"], phone_d, folio) >= max_pp:
+        return {"ok": False, "message": f"Ese teléfono ya tiene el máximo de {max_pp} boletos"}
+    # Un boleto que ya tiene dueño no puede ser retomado por otro teléfono
+    owner = (ticket.get("participant") or {}).get("phone")
+    if owner and owner != phone_d:
+        return {"ok": False, "message": "Este folio ya está registrado con otro teléfono"}
 
     new_status = "registered" if ticket["status"] in ("free", "delivered") else ticket["status"]
-    db.tickets.update_one(
-        {"_id": ticket["_id"]},
+    res = db.tickets.update_one(
+        {"_id": ticket["_id"], "status": {"$in": ["free", "delivered", "registered", "scratched"]}},
         {
             "$set": {
                 "participant": {"name": name.strip(), "phone": phone_d},
@@ -398,6 +459,8 @@ def register_participant(
             }
         },
     )
+    if res.matched_count == 0:
+        return {"ok": False, "message": "Este folio cambió de estado; intenta de nuevo"}
     return {
         "ok": True,
         "folio": folio,
@@ -414,6 +477,8 @@ def scratch_ticket(db: Database, raffle_slug: str, folio: int, code: str) -> dic
         return {"ok": False, "message": "Código de acceso incorrecto"}
 
     status = ticket["status"]
+    if raffle.get("status") == "drawn" and status != "paid" and status != "scratched":
+        return {"ok": False, "message": "El sorteo ya fue realizado"}
     if status == "paid":
         return {"ok": True, "amount": ticket["amount"], "folio": folio, "message": "Ya está pagado"}
     if status == "scratched":
@@ -421,8 +486,8 @@ def scratch_ticket(db: Database, raffle_slug: str, folio: int, code: str) -> dic
     if status in ("free", "delivered", "registered"):
         if not (ticket.get("participant") or {}).get("name"):
             return {"ok": False, "message": "Debes registrarte antes de raspar"}
-        db.tickets.update_one(
-            {"_id": ticket["_id"]},
+        res = db.tickets.update_one(
+            {"_id": ticket["_id"], "status": {"$in": ["free", "delivered", "registered"]}},
             {
                 "$set": {
                     "status": "scratched",
@@ -431,17 +496,17 @@ def scratch_ticket(db: Database, raffle_slug: str, folio: int, code: str) -> dic
                 }
             },
         )
+        if res.matched_count == 0:
+            return {"ok": False, "message": "Este folio cambió de estado; intenta de nuevo"}
         return {"ok": True, "amount": ticket["amount"], "folio": folio, "message": "¡Boleto raspado!"}
     return {"ok": False, "message": "Estado no válido para raspar"}
 
 
 # ---------- Sorteo ----------
-def run_draw(db: Database, raffle_id: str) -> dict:
-    """Sorteo entre boletos pagados. Devuelve el ganador."""
+def run_draw(db: Database, raffle_id: str, by: str | None = None) -> dict:
+    """Sorteo entre boletos pagados. Atómico: solo un sorteo puede ganar. Devuelve el ganador."""
     rid = oid(raffle_id)
-    raffle = db.raffles.find_one({"_id": rid})
-    if not raffle:
-        raise ValueError("Sorteo no encontrado")
+    raffle = _raffle_of(db, rid)
     if raffle.get("status") == "drawn":
         raise ValueError("El sorteo ya fue realizado")
     if raffle.get("status") == "draft":
@@ -450,35 +515,48 @@ def run_draw(db: Database, raffle_id: str) -> dict:
     pagados = list(db.tickets.find({"raffle_id": rid, "status": "paid"}))
     if not pagados:
         raise ValueError("No hay boletos pagados para sortear")
+    sin_dueno = [t["folio"] for t in pagados if not (t.get("participant") or {}).get("phone")]
+    if sin_dueno:
+        raise ValueError(f"Hay boletos pagados sin participante (folios {sin_dueno}); corrígelos antes de sortear")
 
     ganador = secrets.choice(pagados)
+    now = now_utc()
     winner_doc = {
         "ticket_id": str(ganador["_id"]),
         "folio": ganador["folio"],
         "amount": ganador["amount"],
         "participant": ganador.get("participant"),
     }
-
-    db.raffles.update_one(
-        {"_id": rid},
+    # Reclamo atómico: solo gana el primero que cambia el estado a 'drawn'
+    res = db.raffles.update_one(
+        {"_id": rid, "status": {"$in": ["open", "closed"]}},
         {
             "$set": {
                 "status": "drawn",
-                "drawn_at": now_utc(),
+                "drawn_at": now,
                 "winner": winner_doc,
+                # evidencia para poder verificar el resultado después
+                "draw_audit": {
+                    "eligible_folios": sorted(t["folio"] for t in pagados),
+                    "total_paid": len(pagados),
+                    "method": "secrets.choice (CSPRNG)",
+                    "by": by,
+                },
             }
         },
     )
-    db.tickets.update_one({"_id": ganador["_id"]}, {"$set": {"is_winner": True, "updated_at": now_utc()}})
+    if res.modified_count == 0:
+        raise ValueError("El sorteo ya fue realizado")
+    db.tickets.update_one({"_id": ganador["_id"]}, {"$set": {"is_winner": True, "updated_at": now}})
+    audit(db, "draw", by=by, raffle_id=rid, folio=ganador["folio"], total_paid=len(pagados))
     return {"winner": winner_doc, "total_paid": len(pagados)}
 
 
-def close_raffle(db: Database, raffle_id: str) -> dict:
+def close_raffle(db: Database, raffle_id: str, by: str | None = None) -> dict:
     rid = oid(raffle_id)
-    raffle = db.raffles.find_one({"_id": rid})
-    if not raffle:
-        raise ValueError("Sorteo no encontrado")
+    raffle = _raffle_of(db, rid)
     if raffle["status"] == "drawn":
         raise ValueError("El sorteo ya fue realizado")
-    db.raffles.update_one({"_id": rid}, {"$set": {"status": "closed"}})
+    db.raffles.update_one({"_id": rid, "status": {"$ne": "drawn"}}, {"$set": {"status": "closed"}})
+    audit(db, "close", by=by, raffle_id=rid)
     return get_raffle(db, raffle_id)  # type: ignore[return-value]

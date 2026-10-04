@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,15 +18,23 @@ class Settings(BaseSettings):
     mongo_db: str = "sorteo_natura"
 
     # JWT
-    jwt_secret: str = "dev-only-secret-change-me-32bytes-min!!"
+    # Obligatorio vía variable de entorno / .env (sin default a propósito)
+    jwt_secret: str = Field(min_length=32)
     jwt_alg: str = "HS256"
     access_ttl_min: int = 60
     refresh_ttl_days: int = 14
 
-    # Seed admin (dev bootstrap — cambiar en producción)
-    seed_admin_phone: str = "4461445984"
-    seed_admin_password: str = "Yuri183c97abril"
+    # Seed admin: solo se usa si no existe el usuario. Obligatorios vía entorno.
+    seed_admin_phone: str
+    seed_admin_password: str = Field(min_length=8)
     seed_admin_name: str = "Yuri"
+
+    # Zona horaria del sorteo y proxies de confianza (Vercel -> Render = 2)
+    timezone: str = "America/Mexico_City"
+    proxy_hops: int = 2
+
+    # Horas sin pagar antes de liberar un boleto registrado/raspado
+    auto_release_hours: int = 48
 
     # CORS — Angular dev server
     cors_origins: str = "http://localhost:4200,http://127.0.0.1:4200"

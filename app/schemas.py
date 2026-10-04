@@ -1,13 +1,27 @@
 """Pydantic schemas — contratos de la API."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 TicketStatus = Literal["free", "delivered", "registered", "scratched", "paid", "released"]
 RaffleStatus = Literal["draft", "open", "closed", "drawn"]
+
+
+def _check_date(v: Optional[str]) -> Optional[str]:
+    """draw_date debe ser YYYY-MM-DD (se compara como texto al cerrar sorteos)."""
+    if v is None or not str(v).strip():
+        return None
+    v = str(v).strip()
+    try:
+        date.fromisoformat(v)
+    except ValueError:
+        raise ValueError("La fecha del sorteo debe tener formato AAAA-MM-DD")
+    if len(v) != 10:
+        raise ValueError("La fecha del sorteo debe tener formato AAAA-MM-DD")
+    return v
 
 
 # ---------- Auth ----------
@@ -60,6 +74,11 @@ class RaffleCreate(BaseModel):
     meet_url: Optional[str] = None
     max_tickets_per_person: int = Field(default=3, ge=0, description="0 = sin límite")
 
+    @field_validator("draw_date")
+    @classmethod
+    def _date(cls, v: Optional[str]) -> Optional[str]:
+        return _check_date(v)
+
     @field_validator("price_max")
     @classmethod
     def _max_ge_min(cls, v: int, info) -> int:
@@ -69,14 +88,19 @@ class RaffleCreate(BaseModel):
 
 
 class RaffleUpdate(BaseModel):
-    title: Optional[str] = None
-    prize: Optional[str] = None
-    prize_value: Optional[int] = None
+    title: Optional[str] = Field(default=None, min_length=3, max_length=120)
+    prize: Optional[str] = Field(default=None, min_length=3, max_length=300)
+    prize_value: Optional[int] = Field(default=None, ge=0)
     draw_date: Optional[str] = None
     notes: Optional[str] = None
     image_url: Optional[str] = None
     meet_url: Optional[str] = None
-    max_tickets_per_person: Optional[int] = None
+    max_tickets_per_person: Optional[int] = Field(default=None, ge=0)
+
+    @field_validator("draw_date")
+    @classmethod
+    def _date(cls, v: Optional[str]) -> Optional[str]:
+        return _check_date(v)
 
 
 class RaffleOut(BaseModel):
@@ -97,6 +121,7 @@ class RaffleOut(BaseModel):
     created_at: datetime
     drawn_at: Optional[datetime] = None
     winner: Optional[dict] = None
+    draw_audit: Optional[dict] = None
 
 
 class RaffleStats(BaseModel):
@@ -136,7 +161,40 @@ class TicketAssign(BaseModel):
 
 
 class TicketPaidIn(BaseModel):
-    note: Optional[str] = None
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+class TicketUnpayIn(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+class ClaimIn(BaseModel):
+    folio: int = Field(ge=1)
+    name: str = Field(min_length=3, max_length=120)
+    phone: str = Field(min_length=10, max_length=20)
+
+    @field_validator("phone")
+    @classmethod
+    def _digits(cls, v: str) -> str:
+        d = "".join(c for c in v if c.isdigit())
+        if len(d) < 10:
+            raise ValueError("Teléfono debe tener 10 dígitos")
+        return d
+
+
+class MineItem(BaseModel):
+    folio: int = Field(ge=1)
+    code: str = Field(min_length=3, max_length=12)
+
+
+class MineIn(BaseModel):
+    tickets: list[MineItem] = Field(max_length=20)
+
+
+class ReleaseIn(BaseModel):
+    folio: int = Field(ge=1)
+    phone: str = Field(min_length=10, max_length=20)
+    code: str = Field(min_length=3, max_length=12)
 
 
 # ---------- Público (participante) ----------

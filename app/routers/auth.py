@@ -1,9 +1,10 @@
 """Auth: login y refresh para el dashboard de Yuri."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
 from app.db import get_db
+from app.ratelimit import check_rate
 from app.schemas import LoginIn, RefreshIn, TokenOut
 from app.security import (
     create_access_token,
@@ -16,7 +17,8 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=TokenOut)
-def login(body: LoginIn) -> TokenOut:
+def login(body: LoginIn, request: Request) -> TokenOut:
+    check_rate(request, "login", 8)
     db = get_db()
     user = db.users.find_one({"phone": body.phone})
     if not user or not verify_password(body.password, user.get("password_hash", "")):
@@ -28,15 +30,16 @@ def login(body: LoginIn) -> TokenOut:
     name = user.get("name", "")
     sub = str(user["_id"])
     return TokenOut(
-        access_token=create_access_token(sub=sub, role=role, name=name),
-        refresh_token=create_refresh_token(sub=sub, role=role),
+        access_token=create_access_token(sub=sub, role=role, name=name, tv=user.get("token_version", 0)),
+        refresh_token=create_refresh_token(sub=sub, role=role, tv=user.get("token_version", 0)),
         role=role,
         name=name,
     )
 
 
 @router.post("/refresh", response_model=TokenOut)
-def refresh(body: RefreshIn) -> TokenOut:
+def refresh(body: RefreshIn, request: Request) -> TokenOut:
+    check_rate(request, "refresh", 30)
     payload = decode_token(body.refresh_token, expect="refresh")
     db = get_db()
     from bson import ObjectId
@@ -47,12 +50,16 @@ def refresh(body: RefreshIn) -> TokenOut:
         user = None
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Usuario no encontrado")
+    if not user.get("active", True):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cuenta desactivada")
+    if user.get("token_version", 0) != payload.get("tv", 0):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sesión cerrada; inicia sesión de nuevo")
     role = user.get("role", "collab")
     name = user.get("name", "")
     sub = str(user["_id"])
     return TokenOut(
-        access_token=create_access_token(sub=sub, role=role, name=name),
-        refresh_token=create_refresh_token(sub=sub, role=role),
+        access_token=create_access_token(sub=sub, role=role, name=name, tv=user.get("token_version", 0)),
+        refresh_token=create_refresh_token(sub=sub, role=role, tv=user.get("token_version", 0)),
         role=role,
         name=name,
     )

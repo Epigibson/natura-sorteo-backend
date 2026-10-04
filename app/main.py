@@ -26,49 +26,72 @@ def seed_admin(db) -> None:
             "active": True,
         }
     )
-    print(f"[seed] admin creado: {get_settings().seed_admin_phone} / {get_settings().seed_admin_password}")
+    print(f"[seed] admin creado: {get_settings().seed_admin_phone}")
 
 
-def _new_code():
-    import secrets
-    return "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(4))
+def _local_today() -> str:
+    """Fecha de hoy (YYYY-MM-DD) en la zona horaria del sorteo, no en UTC."""
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(get_settings().timezone)
+    except Exception:
+        tz = timezone(timedelta(hours=-6))  # México centro, sin horario de verano
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
+def run_maintenance(db) -> None:
+    """Cierra sorteos vencidos y libera boletos sin pagar. Es idempotente y atómico por boleto."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.services import raffle_service as rs
+
+    now = datetime.now(timezone.utc)
+    # Cierra sorteos abiertos cuya fecha ya llegó (según hora local)
+    db.raffles.update_many(
+        {"status": "open", "draw_date": {"$nin": [None, ""], "$lte": _local_today()}},
+        {"$set": {"status": "closed"}},
+    )
+    # Auto-liberar boletos sin pagar tras N horas, solo en sorteos aún no sorteados
+    hours = get_settings().auto_release_hours
+    if hours <= 0:
+        return
+    cutoff = now - timedelta(hours=hours)
+    active = [r["_id"] for r in db.raffles.find({"status": {"$in": ["open", "closed"]}}, {"_id": 1})]
+    for t in db.tickets.find({
+        "raffle_id": {"$in": active},
+        "status": {"$in": ["registered", "scratched"]},
+        "registered_at": {"$lt": cutoff},
+    }):
+        res = db.tickets.update_one(
+            # el filtro de estado evita liberar un boleto que se pagó justo ahora
+            {"_id": t["_id"], "status": {"$in": ["registered", "scratched"]}},
+            {"$set": {
+                "status": "free",
+                "participant": None,
+                "delivered_at": None,
+                "registered_at": None,
+                "scratched_at": None,
+                "claimed_from": None,
+                "access_code": rs.generar_codigo(4),
+                "updated_at": now,
+            }},
+        )
+        if res.modified_count:
+            rs.audit(db, "auto_release", raffle_id=t["raffle_id"], folio=t["folio"],
+                     previous=t.get("participant"), previous_status=t["status"])
+            print(f"[auto-release] folio {t['folio']} liberado (sin pagar)")
 
 
 async def _auto_close_loop():
-    """Cierra sorteos automáticamente cuando llega la fecha del sorteo."""
     while True:
         try:
-            from datetime import datetime, timedelta, timezone
-            db = get_db()
-            now = datetime.now(timezone.utc)
-            # Cerrar sorteos abiertos cuya fecha ya pasó
-            db.raffles.update_many(
-                {"status": "open", "draw_date": {"$ne": None, "$lte": now.strftime("%Y-%m-%d")}},
-                {"$set": {"status": "closed"}},
-            )
-            # Auto-liberar boletos raspados sin pagar después de 24h
-            cutoff = now - timedelta(hours=24)
-            expired = db.tickets.find({
-                "status": {"$in": ["registered", "scratched"]},
-                "registered_at": {"$lt": cutoff},
-            })
-            for t in expired:
-                db.tickets.update_one(
-                    {"_id": t["_id"]},
-                    {"$set": {
-                        "status": "free",
-                        "participant": None,
-                        "delivered_at": None,
-                        "registered_at": None,
-                        "scratched_at": None,
-                        "access_code": _new_code(),
-                        "updated_at": now,
-                    }},
-                )
-                print(f"[auto-release] folio {t['folio']} liberado (sin pagar)")
+            await asyncio.to_thread(run_maintenance, get_db())
         except Exception as exc:
             print(f"[auto-close] error: {exc}")
-        await asyncio.sleep(3600)
+        await asyncio.sleep(1800)
 
 
 @asynccontextmanager

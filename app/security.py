@@ -32,7 +32,7 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(*, sub: str, role: str, name: str) -> str:
+def create_access_token(*, sub: str, role: str, name: str, tv: int = 0) -> str:
     s = get_settings()
     now = datetime.now(timezone.utc)
     payload = {
@@ -40,19 +40,21 @@ def create_access_token(*, sub: str, role: str, name: str) -> str:
         "role": role,
         "name": name,
         "type": "access",
+        "tv": tv,
         "iat": now,
         "exp": now + timedelta(minutes=s.access_ttl_min),
     }
     return jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_alg)
 
 
-def create_refresh_token(*, sub: str, role: str) -> str:
+def create_refresh_token(*, sub: str, role: str, tv: int = 0) -> str:
     s = get_settings()
     now = datetime.now(timezone.utc)
     payload = {
         "sub": sub,
         "role": role,
         "type": "refresh",
+        "tv": tv,
         "iat": now,
         "exp": now + timedelta(days=s.refresh_ttl_days),
     }
@@ -82,7 +84,20 @@ def get_current_user(
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Falta token")
     payload = decode_token(creds.credentials, expect="access")
-    return CurrentUser(sub=payload["sub"], role=payload.get("role", ROLE_COLLAB), name=payload.get("name", ""))
+    # Validar contra la BD: usuario existente, activo y con sesión vigente
+    # (al cambiar la contraseña sube token_version y las sesiones viejas dejan de servir).
+    from bson import ObjectId
+
+    from app.db import get_db
+
+    try:
+        user = get_db().users.find_one({"_id": ObjectId(payload["sub"])})
+    except Exception:
+        user = None
+    if not user or not user.get("active", True) or user.get("token_version", 0) != payload.get("tv", 0):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sesión inválida o cerrada")
+    # El rol sale de la BD, no del token: un cambio de rol aplica de inmediato
+    return CurrentUser(sub=payload["sub"], role=user.get("role", ROLE_COLLAB), name=user.get("name", ""))
 
 
 def require_admin(user: Annotated[CurrentUser, Depends(get_current_user)]) -> CurrentUser:

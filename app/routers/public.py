@@ -2,32 +2,28 @@
 from __future__ import annotations
 
 import random
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
 from app.db import get_db
 from app.schemas import (
     AccessCheckIn,
     AccessCheckOut,
+    ClaimIn,
+    MineIn,
     PublicRaffleOut,
     RegisterIn,
+    ReleaseIn,
     ScratchIn,
     ScratchOut,
 )
+from app.ratelimit import check_rate, client_ip
 from app.services import raffle_service as rs
 
 router = APIRouter(prefix="/api/v1/public", tags=["public"])
-# Rate limit global para endpoints públicos
-_public_rate: dict[str, list] = {}
-
-def _check_rate(key: str, max_per_min: int = 10):
-    import time
-    now = time.time()
-    _public_rate[key] = [t for t in _public_rate.get(key, []) if now - t < 60]
-    if len(_public_rate[key]) >= max_per_min:
-        raise HTTPException(429, "Demasiados intentos. Espera un minuto.")
-    _public_rate[key].append(now)
-
+# Máximo de boletos sin pagar que puede tener tomados una misma IP por sorteo
+MAX_UNPAID_PER_IP = 6
 
 
 @router.get("/raffles/{slug}", response_model=PublicRaffleOut)
@@ -101,8 +97,8 @@ def public_board(slug: str) -> dict:
 
 
 @router.post("/access", response_model=AccessCheckOut)
-def access(body: AccessCheckIn) -> AccessCheckOut:
-    _check_rate("access:" + body.raffle_slug, max_per_min=15)
+def access(body: AccessCheckIn, request: Request) -> AccessCheckOut:
+    check_rate(request, "access", 20)
     result = rs.check_access(get_db(), body.raffle_slug, body.folio, body.code)
     if not result.get("ok"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, result.get("message", "Acceso denegado"))
@@ -110,8 +106,8 @@ def access(body: AccessCheckIn) -> AccessCheckOut:
 
 
 @router.post("/register")
-def register(body: RegisterIn) -> dict:
-    _check_rate("register:" + body.raffle_slug, max_per_min=10)
+def register(body: RegisterIn, request: Request) -> dict:
+    check_rate(request, "register", 10)
     result = rs.register_participant(
         get_db(),
         body.raffle_slug,
@@ -126,8 +122,8 @@ def register(body: RegisterIn) -> dict:
 
 
 @router.post("/scratch", response_model=ScratchOut)
-def scratch(body: ScratchIn) -> ScratchOut:
-    _check_rate("scratch:" + body.raffle_slug, max_per_min=15)
+def scratch(body: ScratchIn, request: Request) -> ScratchOut:
+    check_rate(request, "scratch", 20)
     result = rs.scratch_ticket(get_db(), body.raffle_slug, body.folio, body.code)
     if not result.get("ok"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, result.get("message", "No se puede raspar"))
@@ -135,21 +131,12 @@ def scratch(body: ScratchIn) -> ScratchOut:
 
 
 @router.post("/raffles/{slug}/claim")
-def claim_ticket(slug: str, body: dict) -> dict:
-    """Reclamar un boleto libre: registra nombre+teléfono y asigna el folio.
-    Un teléfono = un boleto. No requiere código."""
-    folio = body.get("folio")
-    name = (body.get("name") or "").strip()
-    phone = "".join(c for c in (body.get("phone") or "") if c.isdigit())
-
-    if not folio or not isinstance(folio, int):
-        raise HTTPException(400, "Folio inválido")
-    if len(name) < 3:
-        raise HTTPException(400, "Escribe tu nombre completo")
-    if len(phone) < 10:
-        raise HTTPException(400, "Teléfono debe tener 10 dígitos")
-
-    from app.services import raffle_service as rs
+def claim_ticket(slug: str, body: ClaimIn, request: Request) -> dict:
+    """Reclamar un boleto libre: registra nombre+teléfono y asigna el folio. No requiere código."""
+    check_rate(request, "claim", 10)
+    ip = client_ip(request)
+    name = body.name.strip()
+    phone = body.phone
 
     db = get_db()
     raffle = db.raffles.find_one({"slug": slug})
@@ -158,38 +145,27 @@ def claim_ticket(slug: str, body: dict) -> dict:
     if raffle.get("status") != "open":
         raise HTTPException(400, "El sorteo no está abierto")
 
-    ticket = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": folio})
+    ticket = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": body.folio})
     if not ticket:
         raise HTTPException(404, "Folio no encontrado")
     if ticket["status"] != "free":
         raise HTTPException(400, "Este boleto ya fue tomado")
 
-    # Límite de boletos por persona (independientemente de si ya raspó)
-    max_pp = raffle.get("max_tickets_per_person", 3)  # default 3
-    count = db.tickets.count_documents({
-        "raffle_id": raffle["_id"],
-        "participant.phone": phone,
-        "status": {"$in": ["registered", "scratched", "paid"]},
-    })
-    if count >= max_pp:
+    # Límite de boletos por persona (0 = sin límite)
+    max_pp = raffle.get("max_tickets_per_person", 3)
+    if max_pp and max_pp > 0 and rs.count_tickets_of_phone(db, raffle["_id"], phone) >= max_pp:
         raise HTTPException(400, f"Este teléfono ya tiene el máximo de {max_pp} boletos")
 
-    # ANTITRAMPA 3: rate limit — máximo 5 claims por minuto por IP
-    import time
-    global _claim_rate
-    try:
-        _claim_rate
-    except NameError:
-        _claim_rate = {}
-    ip = "default"
-    now = time.time()
-    _claim_rate[ip] = [t for t in _claim_rate.get(ip, []) if now - t < 60]
-    if len(_claim_rate[ip]) >= 5:
-        raise HTTPException(429, "Demasiados intentos. Espera un minuto.")
-    _claim_rate[ip].append(now)
+    # Antiacaparamiento: una misma IP no puede mantener tomados demasiados boletos sin pagar
+    unpaid_from_ip = db.tickets.count_documents({
+        "raffle_id": raffle["_id"],
+        "claimed_from": ip,
+        "status": {"$in": ["registered", "scratched"]},
+    })
+    if unpaid_from_ip >= MAX_UNPAID_PER_IP:
+        raise HTTPException(429, "Tienes demasiados boletos pendientes de pago. Paga alguno o contacta a Yuri.")
 
-    # ANTITRAMPA 4: atomic claim — solo si sigue libre (evita race condition)
-    from datetime import datetime, timezone
+    # Reclamo atómico: solo si sigue libre (evita condiciones de carrera)
     now = datetime.now(timezone.utc)
     result = db.tickets.update_one(
         {"_id": ticket["_id"], "status": "free"},
@@ -199,58 +175,83 @@ def claim_ticket(slug: str, body: dict) -> dict:
             "registered_at": now,
             "delivered_at": now,
             "updated_at": now,
+            "claimed_from": ip,
         }},
     )
     if result.modified_count == 0:
         raise HTTPException(400, "Este boleto fue tomado por otra persona")
 
-
-
     return {
         "ok": True,
-        "folio": folio,
+        "folio": body.folio,
         "code": ticket["access_code"],
-        "message": f"Folio {folio} asignado a {name}",
+        "message": f"Folio {body.folio} asignado a {name}",
         "notify": True,
     }
 
+
 @router.post("/raffles/{slug}/release")
-def release_ticket(slug: str, body: dict) -> dict:
-    """Liberar un boleto reclamado (solo si no ha sido raspado)."""
-    folio = body.get("folio")
-    phone = "".join(ch for ch in (body.get("phone") or "") if ch.isdigit())
-    if not folio or not phone:
-        raise HTTPException(400, "Folio y teléfono requeridos")
+def release_ticket(slug: str, body: ReleaseIn, request: Request) -> dict:
+    """Liberar un boleto reclamado (solo si no ha sido raspado ni pagado).
+
+    Requiere folio + teléfono + código de acceso: el teléfono solo no basta."""
+    check_rate(request, "release", 10)
+    phone = body.phone and "".join(ch for ch in body.phone if ch.isdigit())
 
     db = get_db()
     raffle = db.raffles.find_one({"slug": slug})
     if not raffle:
         raise HTTPException(404, "Sorteo no encontrado")
+    if raffle.get("status") == "drawn":
+        raise HTTPException(400, "El sorteo ya fue realizado")
 
-    ticket = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": folio})
+    ticket = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": body.folio})
     if not ticket:
         raise HTTPException(404, "Folio no encontrado")
 
     p = ticket.get("participant") or {}
-    if p.get("phone") != phone:
+    if p.get("phone") != phone or ticket["access_code"].upper() != body.code.strip().upper():
+        # mismo mensaje para ambos casos: no revelar cuál dato falló
         raise HTTPException(403, "Este boleto no te pertenece")
-    if ticket["status"] in ("scratched", "paid"):
-        raise HTTPException(400, "No se puede liberar un boleto ya raspado o pagado")
 
-    import secrets
-    new_code = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(4))
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
-
-    db.tickets.update_one(
-        {"_id": ticket["_id"]},
+    res = db.tickets.update_one(
+        # el filtro de estado evita liberar un boleto que se acaba de raspar o pagar
+        {"_id": ticket["_id"], "status": {"$in": ["delivered", "registered"]}},
         {"$set": {
             "status": "free",
             "participant": None,
             "delivered_at": None,
             "registered_at": None,
-            "access_code": new_code,
+            "claimed_from": None,
+            "access_code": rs.generar_codigo(4),
             "updated_at": now,
         }},
     )
-    return {"ok": True, "folio": folio, "message": "Boleto liberado"}
+    if res.modified_count == 0:
+        raise HTTPException(400, "No se puede liberar un boleto ya raspado o pagado")
+    rs.audit(db, "release_by_participant", raffle_id=raffle["_id"], folio=body.folio)
+    return {"ok": True, "folio": body.folio, "message": "Boleto liberado"}
+
+
+@router.post("/raffles/{slug}/mine")
+def check_mine(slug: str, body: MineIn, request: Request) -> dict:
+    """El navegador del participante pregunta si sus boletos guardados siguen siendo suyos.
+
+    Si Yuri (o la auto-liberación) soltó un boleto, su código rotó y aquí sale como
+    'released', para que el navegador lo borre de su almacenamiento local."""
+    check_rate(request, "mine", 30)
+    db = get_db()
+    raffle = db.raffles.find_one({"slug": slug})
+    if not raffle:
+        raise HTTPException(404, "Sorteo no encontrado")
+    out = []
+    for item in body.tickets:
+        t = db.tickets.find_one({"raffle_id": raffle["_id"], "folio": item.folio})
+        valid = bool(
+            t
+            and t["access_code"].upper() == item.code.strip().upper()
+            and t["status"] in ("delivered", "registered", "scratched", "paid")
+        )
+        out.append({"folio": item.folio, "valid": valid, "status": t["status"] if valid else "released"})
+    return {"tickets": out}
