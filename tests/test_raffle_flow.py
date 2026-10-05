@@ -652,3 +652,29 @@ def test_collab_excel_hides_access_codes(client, admin, db, raffle):
 
     assert codes & cells(admin)          # el admin sí ve los códigos
     assert not (codes & cells(collab))   # la colaboradora no
+
+
+# ---------- transparencia del sorteo ----------
+def test_board_lists_participating_folios_without_names(client, admin, raffle):
+    s, rid = raffle["slug"], raffle["id"]
+    claim(client, s, 3)
+    claim(client, s, 1, phone="5599887766")
+    claim(client, s, 2, phone="5588776655")
+    pay(client, admin, rid, 3)
+    pay(client, admin, rid, 1)
+    b = client.get(f"/api/v1/public/raffles/{s}/board").json()
+    assert b["participating_folios"] == [1, 3]  # solo pagados, ordenados
+    assert "Ana" not in str(b) and PHONE not in str(b)
+
+
+def test_board_after_draw_shows_exact_draw_list(client, admin, db, raffle):
+    s, rid = raffle["slug"], raffle["id"]
+    claim(client, s, 1)
+    claim(client, s, 2, phone="5599887766")
+    pay(client, admin, rid, 1)
+    pay(client, admin, rid, 2)
+    client.post(f"/api/v1/raffles/{rid}/draw", headers=admin)
+    db.tickets.update_one({"folio": 2}, {"$set": {"status": "registered"}})  # cambio posterior
+    b = client.get(f"/api/v1/public/raffles/{s}/board").json()
+    assert b["participating_folios"] == [1, 2]  # la lista que se usó, no la de ahora
+    assert b["drawn_at"] and b["winner_folio"] in (1, 2)

@@ -82,6 +82,17 @@ def public_board(slug: str) -> dict:
     paid = sum(1 for c in cards if c["status"] == "paid")
     free = sum(1 for c in cards if c["status"] == "free")
 
+    # Transparencia: qué folios entran al sorteo (solo números, nunca nombres). Tras sortear se
+    # publica la lista EXACTA que usó el sorteo, guardada en ese instante.
+    drawn = raffle.get("status") == "drawn"
+    audit = raffle.get("draw_audit") or {}
+    participating = (
+        audit.get("eligible_folios", [])
+        if drawn
+        else sorted(t["folio"] for t in tickets if t.get("status") == "paid")
+    )
+    drawn_at = raffle.get("drawn_at")
+
     return {
         "slug": raffle["slug"],
         "title": raffle["title"],
@@ -95,6 +106,8 @@ def public_board(slug: str) -> dict:
         "winner_folio": (raffle.get("winner") or {}).get("folio"),
         "paid_count": paid,
         "free_count": free,
+        "participating_folios": participating,
+        "drawn_at": drawn_at.isoformat() if drawn and drawn_at else None,
         "cards": cards,
     }
 
