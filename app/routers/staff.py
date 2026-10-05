@@ -499,28 +499,29 @@ def export_backup(
     tickets = rs.list_tickets(db, raffle_id)
     stats = rs.stats_sorteo(db, raffle_id)
 
-    # Serializar fechas a ISO
-    def serialize(obj):
-        if hasattr(obj, "isoformat"):
-            return obj.isoformat()
-        return obj
-
-    for t in tickets:
-        for k in ("delivered_at", "registered_at", "scratched_at", "paid_at", "updated_at", "created_at"):
-            if t.get(k):
-                t[k] = serialize(t[k])
-    for k in ("created_at", "drawn_at"):
-        if raffle.get(k):
-            raffle[k] = serialize(raffle[k])
+    # Bitácora del sorteo (pagos, liberaciones, sorteo) para poder reconstruir lo ocurrido
+    audit_rows = [
+        {k: v for k, v in row.items() if k != "_id"}
+        for row in db.audit_log.find({"raffle_id": raffle_id}).sort("at", 1)
+    ]
 
     data = {
-        "backup_version": 1,
-        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "backup_version": 2,
+        "exported_at": datetime.now(timezone.utc),
         "raffle": raffle,
         "stats": stats,
         "tickets": tickets,
+        "audit_log": audit_rows,
     }
-    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+
+    # Cualquier fecha/ObjectId se serializa solo: antes un campo nuevo (p. ej. updated_at tras
+    # editar) tumbaba todo el respaldo con un 500.
+    def _default(obj):
+        if hasattr(obj, "isoformat"):
+            return obj.isoformat()
+        return str(obj)
+
+    json_str = json.dumps(data, ensure_ascii=False, indent=2, default=_default)
     buf = io.BytesIO(json_str.encode("utf-8"))
     return StreamingResponse(
         buf,

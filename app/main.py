@@ -54,20 +54,28 @@ def run_maintenance(db) -> None:
         {"status": "open", "draw_date": {"$nin": [None, ""], "$lte": _local_today()}},
         {"$set": {"status": "closed"}},
     )
-    # Auto-liberar boletos sin pagar tras N horas, solo en sorteos aún no sorteados
+    # Un sorteo que quedó en 'drawing' (el proceso murió a media ejecución) se destraba
+    for r in db.raffles.find({"status": "drawing", "drawing_at": {"$lt": now - timedelta(minutes=10)}}):
+        db.raffles.update_one({"_id": r["_id"], "status": "drawing"}, {"$set": {"status": r.get("prev_status") or "closed"}})
+        rs.audit(db, "draw_unlock", raffle_id=r["_id"])
+
+    # Auto-liberar boletos sin pagar tras N horas. Solo en sorteos ABIERTOS: una vez cerrada la
+    # venta nadie podría volver a registrarse, y perder un boleto ya pagado sería irreparable.
     hours = get_settings().auto_release_hours
     if hours <= 0:
         return
     cutoff = now - timedelta(hours=hours)
-    active = [r["_id"] for r in db.raffles.find({"status": {"$in": ["open", "closed"]}}, {"_id": 1})]
+    active = [r["_id"] for r in db.raffles.find({"status": "open"}, {"_id": 1})]
     for t in db.tickets.find({
         "raffle_id": {"$in": active},
         "status": {"$in": ["registered", "scratched"]},
         "registered_at": {"$lt": cutoff},
+        "payment_reported_at": None,  # quien avisó "ya pagué" espera confirmación: no se libera
     }):
         res = db.tickets.update_one(
             # el filtro de estado evita liberar un boleto que se pagó justo ahora
-            {"_id": t["_id"], "status": {"$in": ["registered", "scratched"]}},
+            {"_id": t["_id"], "status": {"$in": ["registered", "scratched"]},
+             "registered_at": t["registered_at"], "payment_reported_at": None},
             {"$set": {
                 "status": "free",
                 "participant": None,

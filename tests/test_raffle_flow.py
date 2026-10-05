@@ -206,7 +206,7 @@ def test_mine_detects_ticket_released_by_staff(client, admin, raffle):
     s = raffle["slug"]
     code = claim(client, s, 1).json()["code"]
     url = f"/api/v1/public/raffles/{s}/mine"
-    body = {"tickets": [{"folio": 1, "code": code}]}
+    body = {"phone": PHONE, "tickets": [{"folio": 1, "code": code}]}
     assert client.post(url, json=body).json()["tickets"][0]["valid"] is True
     client.post(f"/api/v1/raffles/{raffle['id']}/tickets/1/release", headers=admin)
     assert client.post(url, json=body).json()["tickets"][0]["valid"] is False  # código rotado
@@ -230,3 +230,235 @@ def test_password_change_revokes_old_sessions(client, admin):
 def test_deactivated_user_loses_access_immediately(client, admin, db):
     db.users.update_one({"phone": "5500000000"}, {"$set": {"active": False}})
     assert client.get("/api/v1/me", headers=admin).status_code == 401
+
+
+# =====================================================================
+# LOTE 1: robustez (códigos, teléfonos, auto-liberación, sorteo, respaldo)
+# =====================================================================
+import app.routers.public as pub
+
+
+def access(client, slug, folio, code, ip="1.1.1.1"):
+    return client.post("/api/v1/public/access", json={"raffle_slug": slug, "folio": folio, "code": code},
+                       headers={"x-forwarded-for": f"{ip}, 9.9.9.9"})
+
+
+def test_codes_are_six_chars(db, raffle):
+    assert {len(t["access_code"]) for t in db.tickets.find()} == {6}
+
+
+def test_mine_is_not_a_code_oracle(client, raffle):
+    """Con el código correcto pero sin el teléfono del titular, /mine no confirma nada."""
+    s = raffle["slug"]
+    code = claim(client, s, 1).json()["code"]
+    url = f"/api/v1/public/raffles/{s}/mine"
+    wrong_phone = client.post(url, json={"phone": "5500000099", "tickets": [{"folio": 1, "code": code}]})
+    assert wrong_phone.json()["tickets"][0]["valid"] is False
+    assert client.post(url, json={"tickets": [{"folio": 1, "code": code}]}).status_code == 422  # teléfono obligatorio
+
+
+def test_mine_cost_counts_every_ticket(client, raffle):
+    """20 códigos por petición ya no multiplican el ritmo de intentos: cada uno cuenta."""
+    url = f"/api/v1/public/raffles/{raffle['slug']}/mine"
+    body = {"phone": PHONE, "tickets": [{"folio": i, "code": "AAAAAA"} for i in range(1, 21)]}
+    codes = [client.post(url, json=body).status_code for _ in range(5)]
+    assert codes[:3] == [200, 200, 200] and 429 in codes  # 60 intentos/min = 3 peticiones de 20
+
+
+def test_ticket_locks_after_ten_wrong_codes(client, db, raffle):
+    s = raffle["slug"]
+    code = claim(client, s, 1).json()["code"]
+    for i in range(10):
+        assert access(client, s, 1, "ZZZZZZ", ip=f"2.2.2.{i}").status_code == 401
+    r = access(client, s, 1, code, ip="2.2.2.99")  # ni siquiera el correcto pasa durante el bloqueo
+    assert r.status_code == 401 and "Demasiados intentos" in r.json()["detail"]
+    db.tickets.update_one({"folio": 1}, {"$set": {"locked_until": datetime.now(timezone.utc) - timedelta(minutes=1)}})
+    assert access(client, s, 1, code, ip="2.2.2.98").status_code == 200  # vence el bloqueo
+
+
+def test_unknown_folio_and_wrong_code_look_identical(client, raffle):
+    a = access(client, raffle["slug"], 999, "AAAAAA")
+    b = access(client, raffle["slug"], 1, "AAAAAA", ip="3.3.3.3")
+    assert a.json()["detail"] == b.json()["detail"]
+
+
+def test_failure_budget_is_per_raffle_not_per_ip(client, raffle, monkeypatch):
+    """Cambiando de IP (X-Forwarded-For falso) el atacante igual se topa con el techo del sorteo."""
+    monkeypatch.setattr(pub, "CODE_FAIL_BUDGET", 5)
+    s = raffle["slug"]
+    codes = [access(client, s, 999, "AAAAAA", ip=f"7.7.7.{i}").status_code for i in range(8)]
+    assert codes[:5] == [401] * 5 and set(codes[5:]) == {429}
+
+
+def test_login_failures_capped_per_phone_even_with_rotating_ips(client):
+    codes = []
+    for i in range(22):
+        r = client.post("/api/v1/auth/login", json={"phone": "5500000000", "password": "mala-mala-1"},
+                        headers={"x-forwarded-for": f"8.8.8.{i}, 9.9.9.9"})
+        codes.append(r.status_code)
+    assert codes[:20] == [401] * 20 and codes[20:] == [429, 429]
+
+
+def test_phone_prefixes_count_as_same_person(client, raffle):
+    s = raffle["slug"]  # límite 2
+    assert claim(client, s, 1, phone="5511112222").status_code == 200
+    assert claim(client, s, 2, phone="525511112222").status_code == 200
+    assert claim(client, s, 3, phone="+52 1 55 1111 2222").status_code == 400
+
+
+def test_claim_limit_race_is_rolled_back(client, db, raffle, monkeypatch):
+    s = raffle["slug"]
+    db.raffles.update_one({"slug": s}, {"$set": {"max_tickets_per_person": 1}})
+    assert claim(client, s, 1).status_code == 200
+    real, calls = rs.count_tickets_of_phone, {"n": 0}
+    def racy(*a, **k):  # el primer conteo (previo) "no ve" la otra petición simultánea
+        calls["n"] += 1
+        return 0 if calls["n"] == 1 else real(*a, **k)
+    monkeypatch.setattr(rs, "count_tickets_of_phone", racy)
+    assert claim(client, s, 2).status_code == 400
+    assert db.tickets.find_one({"folio": 2})["status"] == "free"  # se deshizo
+
+
+def test_claim_retry_after_lost_response_returns_same_code(client, db, raffle):
+    s = raffle["slug"]
+    hdr = {"x-forwarded-for": "5.5.5.5, 9.9.9.9"}
+    url = f"/api/v1/public/raffles/{s}/claim"
+    body = {"folio": 1, "name": "Ana Pérez", "phone": PHONE}
+    first = client.post(url, json=body, headers=hdr).json()
+    again = client.post(url, json=body, headers=hdr)
+    assert again.status_code == 200 and again.json()["code"] == first["code"] and again.json()["resumed"]
+    other_net = client.post(url, json=body, headers={"x-forwarded-for": "6.6.6.6, 9.9.9.9"})
+    assert other_net.status_code == 400  # desde otra red no se entrega el código
+    other_phone = client.post(url, json={**body, "phone": "5599887766"}, headers=hdr)
+    assert other_phone.status_code == 400
+    db.tickets.update_one({"folio": 1}, {"$set": {"status": "scratched"}})
+    assert client.post(url, json=body, headers=hdr).status_code == 400  # ya raspado: no se reentrega
+
+
+def test_public_board_exposes_ticket_limit(client, raffle):
+    b = client.get(f"/api/v1/public/raffles/{raffle['slug']}/board").json()
+    assert b["max_tickets_per_person"] == 2
+    assert client.get(f"/api/v1/public/raffles/{raffle['slug']}").json()["max_tickets_per_person"] == 2
+
+
+# ---------- auto-liberación ----------
+def _age(db, folio, hours=100):
+    db.tickets.update_one({"folio": folio}, {"$set": {"registered_at": datetime.now(timezone.utc) - timedelta(hours=hours)}})
+
+
+def test_auto_release_never_touches_closed_raffles(client, admin, db, raffle):
+    s = raffle["slug"]
+    claim(client, s, 1)
+    _age(db, 1)
+    client.post(f"/api/v1/raffles/{raffle['id']}/close", headers=admin)
+    run_maintenance(db)
+    assert db.tickets.find_one({"folio": 1})["status"] == "registered"
+
+
+def test_paid_report_pauses_auto_release(client, db, raffle):
+    s = raffle["slug"]
+    code = claim(client, s, 1).json()["code"]
+    claim(client, s, 2, phone="5599887766")
+    r = client.post(f"/api/v1/public/raffles/{s}/paid-report", json={"folio": 1, "code": code})
+    assert r.status_code == 200
+    bad = client.post(f"/api/v1/public/raffles/{s}/paid-report", json={"folio": 1, "code": "ZZZZZZ"})
+    assert bad.status_code == 400
+    _age(db, 1)
+    _age(db, 2)
+    run_maintenance(db)
+    assert db.tickets.find_one({"folio": 1})["status"] == "registered"  # avisó: se conserva
+    assert db.tickets.find_one({"folio": 2})["status"] == "free"        # no avisó: se libera
+
+
+# ---------- sorteo: candado y carreras ----------
+def _two_paid(client, admin, raffle):
+    claim(client, raffle["slug"], 1)
+    claim(client, raffle["slug"], 2, phone="5599887766")
+    pay(client, admin, raffle["id"], 1)
+    pay(client, admin, raffle["id"], 2)
+
+
+def test_payments_blocked_while_drawing(client, admin, db, raffle):
+    claim(client, raffle["slug"], 1)
+    db.raffles.update_one({"slug": raffle["slug"]}, {"$set": {"status": "drawing"}})
+    assert pay(client, admin, raffle["id"], 1).status_code == 400
+
+
+def test_failed_draw_releases_the_lock(client, admin, db, raffle):
+    r = client.post(f"/api/v1/raffles/{raffle['id']}/draw", headers=admin)  # nadie pagó
+    assert r.status_code == 400
+    assert db.raffles.find_one({"slug": raffle["slug"]})["status"] == "open"
+    assert client.post(f"/api/v1/raffles/{raffle['id']}/close", headers=admin).status_code == 200
+
+
+def test_winner_unpaid_mid_draw_is_never_selected(client, admin, db, raffle, monkeypatch):
+    """Si el 'elegido' deja de estar pagado justo al elegirlo, se reintenta con los pagados reales."""
+    _two_paid(client, admin, raffle)
+    real_choice, state = rs.secrets.choice, {"n": 0}
+    def sneaky(seq):
+        pick = real_choice(seq)
+        state["n"] += 1
+        if state["n"] == 1:  # alguien deshace el pago del elegido antes de sellarlo
+            db.tickets.update_one({"_id": pick["_id"]}, {"$set": {"status": "registered"}})
+        return pick
+    monkeypatch.setattr(rs.secrets, "choice", sneaky)
+    r = client.post(f"/api/v1/raffles/{raffle['id']}/draw", headers=admin)
+    assert r.status_code == 200
+    winner = db.tickets.find_one({"folio": r.json()["winner"]["folio"]})
+    assert winner["status"] == "paid" and winner["is_winner"] is True
+    assert db.tickets.count_documents({"is_winner": True}) == 1
+
+
+def test_draw_fails_cleanly_if_every_payment_vanishes(client, admin, db, raffle, monkeypatch):
+    _two_paid(client, admin, raffle)
+    real_choice = rs.secrets.choice
+    def vanish(seq):
+        pick = real_choice(seq)
+        db.tickets.update_many({}, {"$set": {"status": "registered"}})
+        return pick
+    monkeypatch.setattr(rs.secrets, "choice", vanish)
+    r = client.post(f"/api/v1/raffles/{raffle['id']}/draw", headers=admin)
+    assert r.status_code == 400
+    assert db.raffles.find_one({"slug": raffle["slug"]})["status"] == "open"
+    assert db.tickets.count_documents({"is_winner": True}) == 0
+
+
+def test_payment_slipping_in_after_seal_is_reverted(client, admin, db, raffle, monkeypatch):
+    """Un pago que se cuela justo cuando el sorteo ya tiene su lista queda deshecho."""
+    claim(client, raffle["slug"], 1)
+    claim(client, raffle["slug"], 2, phone="5599887766")
+    pay(client, admin, raffle["id"], 1)
+    client.post(f"/api/v1/raffles/{raffle['id']}/draw", headers=admin)
+    # se salta el chequeo previo para simular la ventana de carrera
+    monkeypatch.setattr(rs, "_ensure_not_drawn", lambda raffle: None)
+    r = pay(client, admin, raffle["id"], 2)
+    assert r.status_code == 400
+    assert db.tickets.find_one({"folio": 2})["status"] == "registered"
+
+
+def test_stuck_drawing_is_unlocked_by_maintenance(db, client, raffle):
+    db.raffles.update_one({"slug": raffle["slug"]}, {"$set": {
+        "status": "drawing", "prev_status": "open",
+        "drawing_at": datetime.now(timezone.utc) - timedelta(minutes=30)}})
+    run_maintenance(db)
+    assert db.raffles.find_one({"slug": raffle["slug"]})["status"] == "open"
+
+
+# ---------- respaldo ----------
+def test_backup_works_after_editing_the_raffle(client, admin, raffle):
+    claim(client, raffle["slug"], 1)
+    pay(client, admin, raffle["id"], 1)
+    assert client.patch(f"/api/v1/raffles/{raffle['id']}", headers=admin, json={"notes": "editado"}).status_code == 200
+    r = client.get(f"/api/v1/raffles/{raffle['id']}/export/backup", headers=admin)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["backup_version"] == 2 and data["raffle"]["notes"] == "editado"
+    assert any(a["action"] == "pay" for a in data["audit_log"])
+
+
+def test_staff_assign_normalizes_phone_for_the_limit(client, admin, raffle):
+    base = f"/api/v1/raffles/{raffle['id']}/tickets"
+    assert client.post(f"{base}/1/assign", headers=admin, json={"name": "Ana Pérez", "phone": "5511112222"}).status_code == 200
+    assert client.post(f"{base}/2/assign", headers=admin, json={"name": "Ana Pérez", "phone": "+52 55 1111 2222"}).status_code == 200
+    r = client.post(f"{base}/3/assign", headers=admin, json={"name": "Ana Pérez", "phone": "525511112222"})
+    assert r.status_code == 400  # límite 2: es la misma persona

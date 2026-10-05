@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request, status
 
 from app.db import get_db
-from app.ratelimit import check_rate
+from app.ratelimit import check_rate, fail, guard
 from app.schemas import LoginIn, RefreshIn, TokenOut
 from app.security import (
     create_access_token,
@@ -19,9 +19,14 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 @router.post("/login", response_model=TokenOut)
 def login(body: LoginIn, request: Request) -> TokenOut:
     check_rate(request, "login", 8)
+    # Tope de fallos por teléfono, independiente de la IP (que se puede falsear llamando
+    # directo al backend): 20 fallos en 15 min. Alto a propósito para que un tercero no
+    # pueda dejar a Yuri fuera con unos pocos intentos.
+    guard(f"loginfail:{body.phone}", 20, window=900, message="Demasiados intentos. Espera 15 minutos.")
     db = get_db()
     user = db.users.find_one({"phone": body.phone})
     if not user or not verify_password(body.password, user.get("password_hash", "")):
+        fail(f"loginfail:{body.phone}", window=900)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Teléfono o contraseña incorrectos")
     if not user.get("active", True):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cuenta desactivada")

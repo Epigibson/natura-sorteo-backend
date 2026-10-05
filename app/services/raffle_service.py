@@ -6,12 +6,14 @@ import re
 import secrets
 import string
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bson import ObjectId
 from pymongo.database import Database
 from pymongo import ReturnDocument
+
+from app import ratelimit
 
 # Alfabeto sin caracteres ambiguos (0/O, 1/I/L)
 _ALFABETO = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -29,7 +31,10 @@ def oid(value: str) -> ObjectId:
 
 
 def digits(value: str | None) -> str:
-    return "".join(c for c in (value or "") if c.isdigit())
+    """Solo dígitos y, si trae lada/prefijo (+52, 521...), los últimos 10: un mismo
+    número siempre se guarda y se compara igual."""
+    d = "".join(c for c in (value or "") if c.isdigit())
+    return d[-10:] if len(d) > 10 else d
 
 
 # Estados que ocupan cupo del límite por persona
@@ -54,6 +59,40 @@ def audit(db: Database, action: str, *, by: str | None = None, raffle_id: Any = 
         print(f"[audit] error: {exc}")
 
 
+class CodeLocked(Exception):
+    """El folio está bloqueado temporalmente por demasiados códigos incorrectos."""
+
+
+LOCK_AFTER_FAILS = 10
+LOCK_MINUTES = 15
+MSG_BAD_ACCESS = "Folio o código incorrecto"
+MSG_LOCKED = f"Demasiados intentos con este folio. Intenta de nuevo en {LOCK_MINUTES} minutos."
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
+
+
+def verify_code(db: Database, raffle: dict, ticket: dict, code: str) -> bool:
+    """Compara el código en tiempo constante. 10 fallos bloquean el folio 15 min y cada
+    fallo cuenta contra un presupuesto global del sorteo (no depende de la IP)."""
+    locked = _aware(ticket.get("locked_until"))
+    if locked and locked > now_utc():
+        raise CodeLocked()
+    if secrets.compare_digest(ticket["access_code"].upper().encode(), (code or "").strip().upper().encode()):
+        if ticket.get("code_fails") or ticket.get("locked_until"):
+            db.tickets.update_one({"_id": ticket["_id"]}, {"$set": {"code_fails": 0, "locked_until": None}})
+        return True
+    doc = db.tickets.find_one_and_update({"_id": ticket["_id"]}, {"$inc": {"code_fails": 1}}, return_document=ReturnDocument.AFTER)
+    if doc and doc.get("code_fails", 0) >= LOCK_AFTER_FAILS:
+        db.tickets.update_one(
+            {"_id": ticket["_id"]},
+            {"$set": {"code_fails": 0, "locked_until": now_utc() + timedelta(minutes=LOCK_MINUTES)}},
+        )
+    ratelimit.fail(f"codefail:{raffle['slug']}")
+    return False
+
+
 def _raffle_of(db: Database, rid: ObjectId) -> dict:
     raffle = db.raffles.find_one({"_id": rid})
     if not raffle:
@@ -62,6 +101,8 @@ def _raffle_of(db: Database, rid: ObjectId) -> dict:
 
 
 def _ensure_not_drawn(raffle: dict) -> None:
+    if raffle.get("status") == "drawing":
+        raise ValueError("El sorteo se está realizando; espera unos segundos")
     if raffle.get("status") == "drawn":
         raise ValueError("El sorteo ya fue realizado; no se pueden hacer cambios en los boletos")
 
@@ -73,7 +114,10 @@ def slugify(texto: str) -> str:
     return text[:48] or "sorteo"
 
 
-def generar_codigo(longitud: int = 4) -> str:
+CODE_LEN = 6  # 31^6 ≈ 887 millones de combinaciones (4 eran solo ~923 mil)
+
+
+def generar_codigo(longitud: int = CODE_LEN) -> str:
     return "".join(secrets.choice(_ALFABETO) for _ in range(longitud))
 
 
@@ -99,7 +143,7 @@ def _next_folio_codes(n: int) -> list[str]:
     """n códigos únicos de 4 caracteres."""
     codigos: set[str] = set()
     while len(codigos) < n:
-        codigos.add(generar_codigo(4))
+        codigos.add(generar_codigo())
     return list(codigos)
 
 
@@ -320,6 +364,16 @@ def marcar_pagado(
     )
     if not doc:
         raise ValueError("El boleto cambió mientras se procesaba; revisa su estado")
+    # Si el sorteo arrancó justo entre la validación y la escritura, deshacer: un pago
+    # fuera de la lista de elegibles no debe quedar registrado.
+    after = db.raffles.find_one({"_id": rid}, {"status": 1, "draw_audit": 1}) or {}
+    elegibles = (after.get("draw_audit") or {}).get("eligible_folios", [])
+    if after.get("status") == "drawing" or (after.get("status") == "drawn" and folio not in elegibles):
+        db.tickets.update_one(
+            {"_id": ticket["_id"], "status": "paid"},
+            {"$set": {"status": ticket["status"], "paid_at": None, "paid_by": None, "updated_at": now_utc()}},
+        )
+        raise ValueError("El sorteo se estaba realizando; el pago no se registró")
     audit(db, "pay", by=by, raffle_id=rid, folio=folio, amount=ticket.get("amount"), note=note)
     return _serialize_ticket(doc)
 
@@ -341,6 +395,13 @@ def desmarcar_pago(db: Database, raffle_id: str, folio: int, by: str | None = No
     )
     if not doc:
         raise ValueError("El boleto cambió mientras se procesaba; revisa su estado")
+    after = db.raffles.find_one({"_id": rid}, {"status": 1, "draw_audit": 1}) or {}
+    if after.get("status") == "drawn" and folio in (after.get("draw_audit") or {}).get("eligible_folios", []):
+        db.tickets.update_one(
+            {"_id": ticket["_id"], "status": back},
+            {"$set": {"status": "paid", "paid_at": ticket.get("paid_at"), "paid_by": ticket.get("paid_by"), "updated_at": now_utc()}},
+        )
+        raise ValueError("El sorteo ya se realizó; el pago no se puede deshacer")
     audit(db, "unpay", by=by, raffle_id=rid, folio=folio, reason=reason)
     return _serialize_ticket(doc)
 
@@ -364,7 +425,7 @@ def liberar_boleto(db: Database, raffle_id: str, folio: int, by: str | None = No
                 "delivered_at": None,
                 "registered_at": None,
                 "scratched_at": None,
-                "access_code": generar_codigo(4),
+                "access_code": generar_codigo(),
                 "updated_at": now_utc(),
             },
             "$inc": {"code_rotation": 1},
@@ -391,9 +452,13 @@ def check_access(db: Database, raffle_slug: str, folio: int, code: str) -> dict:
     if not raffle:
         return {"ok": False, "message": "Sorteo no encontrado"}
     if not ticket:
-        return {"ok": False, "message": "Folio no encontrado"}
-    if ticket["access_code"].upper() != code.strip().upper():
-        return {"ok": False, "message": "Código de acceso incorrecto"}
+        ratelimit.fail(f"codefail:{raffle['slug']}")
+        return {"ok": False, "message": MSG_BAD_ACCESS}  # igual que código malo: no revela qué folios existen
+    try:
+        if not verify_code(db, raffle, ticket, code):
+            return {"ok": False, "message": MSG_BAD_ACCESS}
+    except CodeLocked:
+        return {"ok": False, "message": MSG_LOCKED}
 
     status = ticket["status"]
     needs_reg = status in ("free", "delivered")
@@ -424,9 +489,12 @@ def register_participant(
 ) -> dict:
     raffle, ticket = find_ticket_by_access(db, raffle_slug, folio, code)
     if not raffle or not ticket:
-        return {"ok": False, "message": "Folio o sorteo no encontrado"}
-    if ticket["access_code"].upper() != code.strip().upper():
-        return {"ok": False, "message": "Código de acceso incorrecto"}
+        return {"ok": False, "message": MSG_BAD_ACCESS}
+    try:
+        if not verify_code(db, raffle, ticket, code):
+            return {"ok": False, "message": MSG_BAD_ACCESS}
+    except CodeLocked:
+        return {"ok": False, "message": MSG_LOCKED}
     if ticket["status"] == "paid":
         return {"ok": False, "message": "Este folio ya está pagado"}
     if ticket["status"] == "released":
@@ -472,9 +540,12 @@ def register_participant(
 def scratch_ticket(db: Database, raffle_slug: str, folio: int, code: str) -> dict:
     raffle, ticket = find_ticket_by_access(db, raffle_slug, folio, code)
     if not raffle or not ticket:
-        return {"ok": False, "message": "Folio o sorteo no encontrado"}
-    if ticket["access_code"].upper() != code.strip().upper():
-        return {"ok": False, "message": "Código de acceso incorrecto"}
+        return {"ok": False, "message": MSG_BAD_ACCESS}
+    try:
+        if not verify_code(db, raffle, ticket, code):
+            return {"ok": False, "message": MSG_BAD_ACCESS}
+    except CodeLocked:
+        return {"ok": False, "message": MSG_LOCKED}
 
     status = ticket["status"]
     if raffle.get("status") == "drawn" and status != "paid" and status != "scratched":
@@ -502,52 +573,105 @@ def scratch_ticket(db: Database, raffle_slug: str, folio: int, code: str) -> dic
     return {"ok": False, "message": "Estado no válido para raspar"}
 
 
+def reportar_pago(db: Database, raffle_slug: str, folio: int, code: str) -> dict:
+    """La participante avisa 'ya pagué': el boleto deja de ser candidato a auto-liberación."""
+    raffle, ticket = find_ticket_by_access(db, raffle_slug, folio, code)
+    if not raffle or not ticket:
+        return {"ok": False, "message": MSG_BAD_ACCESS}
+    try:
+        if not verify_code(db, raffle, ticket, code):
+            return {"ok": False, "message": MSG_BAD_ACCESS}
+    except CodeLocked:
+        return {"ok": False, "message": MSG_LOCKED}
+    if ticket["status"] == "paid":
+        return {"ok": True, "message": "Tu pago ya está confirmado"}
+    if ticket["status"] not in ("registered", "scratched"):
+        return {"ok": False, "message": "Este boleto no puede reportar pago"}
+    now = now_utc()
+    db.tickets.update_one(
+        {"_id": ticket["_id"], "status": {"$in": ["registered", "scratched"]}},
+        {"$set": {"payment_reported_at": ticket.get("payment_reported_at") or now, "updated_at": now}},
+    )
+    audit(db, "payment_reported", raffle_id=raffle["_id"], folio=folio)
+    return {"ok": True, "message": "Listo, avisamos a la organizadora. Confirmará tu pago pronto."}
+
+
 # ---------- Sorteo ----------
 def run_draw(db: Database, raffle_id: str, by: str | None = None) -> dict:
-    """Sorteo entre boletos pagados. Atómico: solo un sorteo puede ganar. Devuelve el ganador."""
+    """Sorteo entre boletos pagados.
+
+    1) Candado atómico: el sorteo pasa a 'drawing' (solo uno puede lograrlo) y mientras tanto
+       nadie puede marcar/deshacer pagos. 2) Se elige entre los pagados y se comprueba que el
+       elegido siga pagado. 3) Se sella como 'drawn'. Cualquier fallo libera el candado.
+    """
     rid = oid(raffle_id)
     raffle = _raffle_of(db, rid)
-    if raffle.get("status") == "drawn":
+    prev = raffle.get("status")
+    if prev == "drawn":
         raise ValueError("El sorteo ya fue realizado")
-    if raffle.get("status") == "draft":
+    if prev == "drawing":
+        raise ValueError("El sorteo ya se está realizando")
+    if prev == "draft":
         raise ValueError("El sorteo está en borrador")
 
-    pagados = list(db.tickets.find({"raffle_id": rid, "status": "paid"}))
-    if not pagados:
-        raise ValueError("No hay boletos pagados para sortear")
-    sin_dueno = [t["folio"] for t in pagados if not (t.get("participant") or {}).get("phone")]
-    if sin_dueno:
-        raise ValueError(f"Hay boletos pagados sin participante (folios {sin_dueno}); corrígelos antes de sortear")
-
-    ganador = secrets.choice(pagados)
-    now = now_utc()
-    winner_doc = {
-        "ticket_id": str(ganador["_id"]),
-        "folio": ganador["folio"],
-        "amount": ganador["amount"],
-        "participant": ganador.get("participant"),
-    }
-    # Reclamo atómico: solo gana el primero que cambia el estado a 'drawn'
-    res = db.raffles.update_one(
+    lock = db.raffles.update_one(
         {"_id": rid, "status": {"$in": ["open", "closed"]}},
-        {
-            "$set": {
-                "status": "drawn",
-                "drawn_at": now,
-                "winner": winner_doc,
-                # evidencia para poder verificar el resultado después
-                "draw_audit": {
-                    "eligible_folios": sorted(t["folio"] for t in pagados),
-                    "total_paid": len(pagados),
-                    "method": "secrets.choice (CSPRNG)",
-                    "by": by,
-                },
-            }
-        },
+        {"$set": {"status": "drawing", "prev_status": prev, "drawing_at": now_utc()}},
     )
-    if res.modified_count == 0:
-        raise ValueError("El sorteo ya fue realizado")
-    db.tickets.update_one({"_id": ganador["_id"]}, {"$set": {"is_winner": True, "updated_at": now}})
+    if lock.modified_count == 0:
+        raise ValueError("El sorteo ya fue realizado o se está realizando")
+
+    try:
+        ganador = pagados = None
+        for _ in range(3):
+            pagados = list(db.tickets.find({"raffle_id": rid, "status": "paid"}))
+            if not pagados:
+                raise ValueError("No hay boletos pagados para sortear")
+            sin_dueno = [t["folio"] for t in pagados if not (t.get("participant") or {}).get("phone")]
+            if sin_dueno:
+                raise ValueError(f"Hay boletos pagados sin participante (folios {sin_dueno}); corrígelos antes de sortear")
+            candidato = secrets.choice(pagados)
+            # el elegido debe seguir pagado en este instante
+            ok = db.tickets.update_one(
+                {"_id": candidato["_id"], "status": "paid"},
+                {"$set": {"is_winner": True, "updated_at": now_utc()}},
+            )
+            if ok.matched_count == 1:
+                ganador = candidato
+                break
+        if ganador is None:
+            raise ValueError("Los pagos cambiaron durante el sorteo; intenta de nuevo")
+
+        now = now_utc()
+        winner_doc = {
+            "ticket_id": str(ganador["_id"]),
+            "folio": ganador["folio"],
+            "amount": ganador["amount"],
+            "participant": ganador.get("participant"),
+        }
+        fin = db.raffles.update_one(
+            {"_id": rid, "status": "drawing"},
+            {
+                "$set": {
+                    "status": "drawn",
+                    "drawn_at": now,
+                    "winner": winner_doc,
+                    # evidencia para poder verificar el resultado después
+                    "draw_audit": {
+                        "eligible_folios": sorted(t["folio"] for t in pagados),
+                        "total_paid": len(pagados),
+                        "method": "secrets.choice (CSPRNG)",
+                        "by": by,
+                    },
+                }
+            },
+        )
+        if fin.modified_count == 0:
+            raise ValueError("El sorteo cambió de estado durante la ejecución; intenta de nuevo")
+    except Exception:
+        db.raffles.update_one({"_id": rid, "status": "drawing"}, {"$set": {"status": prev}})
+        db.tickets.update_many({"raffle_id": rid, "is_winner": True}, {"$set": {"is_winner": False}})
+        raise
     audit(db, "draw", by=by, raffle_id=rid, folio=ganador["folio"], total_paid=len(pagados))
     return {"winner": winner_doc, "total_paid": len(pagados)}
 
@@ -555,8 +679,8 @@ def run_draw(db: Database, raffle_id: str, by: str | None = None) -> dict:
 def close_raffle(db: Database, raffle_id: str, by: str | None = None) -> dict:
     rid = oid(raffle_id)
     raffle = _raffle_of(db, rid)
-    if raffle["status"] == "drawn":
-        raise ValueError("El sorteo ya fue realizado")
-    db.raffles.update_one({"_id": rid, "status": {"$ne": "drawn"}}, {"$set": {"status": "closed"}})
+    if raffle["status"] in ("drawn", "drawing"):
+        raise ValueError("El sorteo ya fue realizado o se está realizando")
+    db.raffles.update_one({"_id": rid, "status": {"$nin": ["drawn", "drawing"]}}, {"$set": {"status": "closed"}})
     audit(db, "close", by=by, raffle_id=rid)
     return get_raffle(db, raffle_id)  # type: ignore[return-value]

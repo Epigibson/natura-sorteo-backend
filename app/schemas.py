@@ -7,7 +7,15 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 TicketStatus = Literal["free", "delivered", "registered", "scratched", "paid", "released"]
-RaffleStatus = Literal["draft", "open", "closed", "drawn"]
+RaffleStatus = Literal["draft", "open", "closed", "drawing", "drawn"]
+
+
+def _norm_phone(v: str) -> str:
+    """Solo dígitos y últimos 10 (quita +52, 521, etc.)."""
+    d = "".join(c for c in v if c.isdigit())
+    if len(d) < 10:
+        raise ValueError("Teléfono debe tener 10 dígitos")
+    return d[-10:]
 
 
 def _check_date(v: Optional[str]) -> Optional[str]:
@@ -151,13 +159,14 @@ class TicketOut(BaseModel):
     registered_at: Optional[datetime] = None
     scratched_at: Optional[datetime] = None
     paid_at: Optional[datetime] = None
+    payment_reported_at: Optional[datetime] = None
     updated_at: datetime
 
 
 class TicketAssign(BaseModel):
     """Entregar folio + código a una persona (queda 'delivered')."""
     name: Optional[str] = Field(default=None, min_length=3, max_length=120)
-    phone: Optional[str] = Field(default=None, min_length=10, max_length=15)
+    phone: Optional[str] = Field(default=None, min_length=10, max_length=20)
 
 
 class TicketPaidIn(BaseModel):
@@ -176,10 +185,7 @@ class ClaimIn(BaseModel):
     @field_validator("phone")
     @classmethod
     def _digits(cls, v: str) -> str:
-        d = "".join(c for c in v if c.isdigit())
-        if len(d) < 10:
-            raise ValueError("Teléfono debe tener 10 dígitos")
-        return d
+        return _norm_phone(v)
 
 
 class MineItem(BaseModel):
@@ -188,12 +194,30 @@ class MineItem(BaseModel):
 
 
 class MineIn(BaseModel):
+    # El teléfono evita que /mine sirva para adivinar códigos: sin el teléfono del titular
+    # nunca devuelve 'valid'.
+    phone: str = Field(min_length=10, max_length=20)
     tickets: list[MineItem] = Field(max_length=20)
+
+    @field_validator("phone")
+    @classmethod
+    def _digits(cls, v: str) -> str:
+        return _norm_phone(v)
 
 
 class ReleaseIn(BaseModel):
     folio: int = Field(ge=1)
     phone: str = Field(min_length=10, max_length=20)
+    code: str = Field(min_length=3, max_length=12)
+
+    @field_validator("phone")
+    @classmethod
+    def _digits(cls, v: str) -> str:
+        return _norm_phone(v)
+
+
+class ReportPaidIn(BaseModel):
+    folio: int = Field(ge=1)
     code: str = Field(min_length=3, max_length=12)
 
 
@@ -221,15 +245,12 @@ class RegisterIn(BaseModel):
     code: str = Field(min_length=3, max_length=12)
     raffle_slug: str = Field(min_length=3)
     name: str = Field(min_length=3, max_length=120)
-    phone: str = Field(min_length=10, max_length=15)
+    phone: str = Field(min_length=10, max_length=20)
 
     @field_validator("phone")
     @classmethod
     def _digits(cls, v: str) -> str:
-        d = "".join(c for c in v if c.isdigit())
-        if len(d) < 10:
-            raise ValueError("Teléfono debe tener al menos 10 dígitos")
-        return d
+        return _norm_phone(v)
 
 
 class ScratchIn(BaseModel):
@@ -255,6 +276,7 @@ class PublicRaffleOut(BaseModel):
     price_min: int
     price_max: int
     ticket_count: int
+    max_tickets_per_person: Optional[int] = None
     status: RaffleStatus
     draw_date: Optional[str] = None
     paid_count: int
