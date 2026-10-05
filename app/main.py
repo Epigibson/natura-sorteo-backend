@@ -43,9 +43,10 @@ def run_maintenance(db) -> None:
     from app.services import raffle_service as rs
 
     now = datetime.now(timezone.utc)
-    # Cierra sorteos abiertos cuya fecha ya llegó (según hora local)
+    # Cierra la venta al TERMINAR el día del sorteo (hora local): ese día se sigue vendiendo
+    # y, en cuanto se sortea, el sorteo queda sellado de todos modos.
     db.raffles.update_many(
-        {"status": "open", "draw_date": {"$nin": [None, ""], "$lte": _local_today()}},
+        {"status": "open", "draw_date": {"$nin": [None, ""], "$lt": _local_today()}},
         {"$set": {"status": "closed"}},
     )
     # Un sorteo que quedó en 'drawing' (el proceso murió a media ejecución) se destraba

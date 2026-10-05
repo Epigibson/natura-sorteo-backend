@@ -597,3 +597,58 @@ def test_public_traffic_runs_maintenance_when_loop_is_asleep(client, db, raffle)
     m._last_maintenance = 0.0
     client.get(f"/api/v1/public/raffles/{raffle['slug']}")
     assert db.raffles.find_one({"slug": raffle["slug"]})["status"] == "closed"
+
+
+# =====================================================================
+# Decisiones: cierre al terminar el día y permisos de colaboradora
+# =====================================================================
+from app.security import hash_password
+
+
+def _collab(client, db):
+    db.users.insert_one({"phone": "5512340000", "name": "Asistente", "role": "collab", "active": True,
+                         "password_hash": hash_password("Colab12345!")})
+    r = client.post("/api/v1/auth/login", json={"phone": "5512340000", "password": "Colab12345!"})
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+def test_sales_stay_open_during_draw_day_and_close_after(client, admin, db, raffle):
+    s = raffle["slug"]
+    db.raffles.update_one({"slug": s}, {"$set": {"draw_date": rs.local_today()}})
+    run_maintenance(db)
+    assert db.raffles.find_one({"slug": s})["status"] == "open"  # el día del sorteo se sigue vendiendo
+    ayer = (datetime.strptime(rs.local_today(), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    db.raffles.update_one({"slug": s}, {"$set": {"draw_date": ayer}})
+    run_maintenance(db)
+    assert db.raffles.find_one({"slug": s})["status"] == "closed"
+
+
+def test_reopen_allowed_on_draw_day(client, admin, db, raffle):
+    rid = raffle["id"]
+    client.post(f"/api/v1/raffles/{rid}/close", headers=admin)
+    db.raffles.update_one({"slug": raffle["slug"]}, {"$set": {"draw_date": rs.local_today()}})
+    assert client.post(f"/api/v1/raffles/{rid}/reopen", headers=admin).status_code == 200
+
+
+def test_collab_cannot_get_backup_or_history(client, admin, db, raffle):
+    collab = _collab(client, db)
+    assert client.get(f"/api/v1/raffles/{raffle['id']}/export/backup", headers=collab).status_code == 403
+    assert client.get("/api/v1/participants", headers=collab).status_code == 403
+    assert client.get(f"/api/v1/raffles/{raffle['id']}/export/backup", headers=admin).status_code == 200
+    assert client.get("/api/v1/participants", headers=admin).status_code == 200
+
+
+def test_collab_excel_hides_access_codes(client, admin, db, raffle):
+    from io import BytesIO
+    from openpyxl import load_workbook
+    collab = _collab(client, db)
+    codes = {t["access_code"] for t in db.tickets.find()}
+
+    def cells(headers):
+        r = client.get(f"/api/v1/raffles/{raffle['id']}/export/participants", headers=headers)
+        assert r.status_code == 200
+        ws = load_workbook(BytesIO(r.content))["Participantes"]
+        return {c.value for row in ws.iter_rows() for c in row}
+
+    assert codes & cells(admin)          # el admin sí ve los códigos
+    assert not (codes & cells(collab))   # la colaboradora no

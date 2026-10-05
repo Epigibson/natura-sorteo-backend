@@ -277,13 +277,15 @@ def export_participants(
     )
     money_fmt = '"$"#,##0'
 
+    # El código de acceso permite raspar/registrar a nombre de otra persona: solo lo ve el admin
+    show_codes = user.get("role") == "admin"
     headers = [
         "Folio",
         "Nombre",
         "Teléfono",
         "Monto",
         "Estado",
-        "Código",
+        "Código" if show_codes else "Código (solo admin)",
         "Registrado",
         "Raspado",
         "Pagado",
@@ -323,7 +325,7 @@ def export_participants(
             p.get("phone") or "",
             t.get("amount"),
             status_labels.get(t.get("status"), t.get("status")),
-            t.get("access_code"),
+            t.get("access_code") if show_codes else "",
             _fmt_date(t.get("registered_at")),
             _fmt_date(t.get("scratched_at")),
             _fmt_date(t.get("paid_at")),
@@ -468,9 +470,9 @@ def reopen_raffle(
         raise HTTPException(404, "Sorteo no encontrado")
     if doc.get("status") != "closed":
         raise HTTPException(400, "Solo se puede reabrir un sorteo cerrado")
-    # Si la fecha ya llegó, el cierre automático lo volvería a cerrar en minutos
-    if doc.get("draw_date") and doc["draw_date"] <= rs.local_today():
-        raise HTTPException(400, "La fecha del sorteo ya llegó; cámbiala por una futura antes de reabrir la venta")
+    # Si la fecha ya pasó, el cierre automático lo volvería a cerrar en minutos
+    if doc.get("draw_date") and doc["draw_date"] < rs.local_today():
+        raise HTTPException(400, "La fecha del sorteo ya pasó; cámbiala por hoy o una futura antes de reabrir la venta")
     res = db.raffles.update_one({"_id": doc["_id"], "status": "closed"}, {"$set": {"status": "open"}})
     if res.modified_count == 0:
         raise HTTPException(400, "El sorteo cambió de estado; recarga e inténtalo de nuevo")
@@ -481,7 +483,7 @@ def reopen_raffle(
 # ---------- Historial global de participantes ----------
 @router.get("/participants")
 def list_participants(
-    user: Annotated[CurrentUser, Depends(require_staff)],
+    user: Annotated[CurrentUser, Depends(require_admin)],  # teléfonos de todos los sorteos
 ) -> dict:
     """Historial de participantes en todos los sorteos."""
     from app.services import raffle_service as rs
@@ -524,7 +526,7 @@ def list_participants(
 @router.get("/raffles/{raffle_id}/export/backup")
 def export_backup(
     raffle_id: str,
-    user: Annotated[CurrentUser, Depends(require_staff)],
+    user: Annotated[CurrentUser, Depends(require_admin)],  # incluye códigos de acceso
 ) -> dict:
     """Exporta todo el sorteo en JSON (sorteo + boletos + participantes)."""
     import json
