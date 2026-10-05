@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.db import ensure_indexes, get_db
@@ -86,22 +87,50 @@ def run_maintenance(db) -> None:
             print(f"[auto-release] folio {t['folio']} liberado (sin pagar)")
 
 
+_indexes_ready = False
+_last_maintenance = 0.0
+
+
+def _ensure_setup(db) -> None:
+    """Índices + admin semilla. Si Mongo no respondió al arrancar, se reintenta después."""
+    global _indexes_ready
+    if _indexes_ready:
+        return
+    ensure_indexes()
+    seed_admin(db)
+    _indexes_ready = True
+
+
+def maybe_maintenance() -> None:
+    """Mantenimiento 'perezoso': en Render free el proceso duerme y el loop no corre, así que
+    también se ejecuta al recibir tráfico público (máx. una vez por minuto)."""
+    import time
+
+    global _last_maintenance
+    now = time.time()
+    if now - _last_maintenance < 60:
+        return
+    _last_maintenance = now
+    try:
+        db = get_db()
+        _ensure_setup(db)
+        run_maintenance(db)
+    except Exception as exc:
+        print(f"[maintenance] error: {exc}")
+
+
 async def _auto_close_loop():
     while True:
-        try:
-            await asyncio.to_thread(run_maintenance, get_db())
-        except Exception as exc:
-            print(f"[auto-close] error: {exc}")
+        await asyncio.to_thread(maybe_maintenance)
         await asyncio.sleep(1800)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
-        ensure_indexes()
-        seed_admin(get_db())
+        _ensure_setup(get_db())
     except Exception as exc:
-        print(f"[startup] MongoDB no disponible: {exc}")
+        print(f"[startup] MongoDB no disponible, se reintentará: {exc}")
     task = asyncio.create_task(_auto_close_loop())
     yield
     task.cancel()
@@ -109,19 +138,41 @@ async def lifespan(_: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    docs = settings.enable_docs
     app = FastAPI(
         title="Sorteo Natura API",
         description="Backend de rifas con raspadito digital — dashboard para Yuri",
         version="1.0.0",
         lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
-        allow_credentials=True,
+        allow_credentials=False,  # se usa token Bearer, no cookies
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def _guard_and_headers(request: Request, call_next):
+        # Tope de tamaño: 1 MB para JSON, 6 MB solo para subir imágenes
+        limit = 6 * 1024 * 1024 if request.url.path.endswith("/upload-image") else 1024 * 1024
+        try:
+            size = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            size = 0
+        if size > limit:
+            return JSONResponse({"detail": "Petición demasiado grande"}, status_code=413)
+        if request.url.path.startswith("/api/v1/public/"):
+            await asyncio.to_thread(maybe_maintenance)
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
     app.include_router(auth.router)
     app.include_router(staff.router)
     app.include_router(public.router)

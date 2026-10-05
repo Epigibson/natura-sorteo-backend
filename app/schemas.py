@@ -35,7 +35,7 @@ def _check_date(v: Optional[str]) -> Optional[str]:
 # ---------- Auth ----------
 class LoginIn(BaseModel):
     phone: str = Field(min_length=8, max_length=15)
-    password: str = Field(min_length=4)
+    password: str = Field(min_length=4, max_length=128)
 
     @field_validator("phone")
     @classmethod
@@ -59,7 +59,7 @@ class RefreshIn(BaseModel):
 
 
 class ChangePasswordIn(BaseModel):
-    current_password: str = Field(min_length=4)
+    current_password: str = Field(min_length=4, max_length=128)
     new_password: str = Field(min_length=8, max_length=72)
 
     @field_validator("new_password")
@@ -77,10 +77,10 @@ class RaffleCreate(BaseModel):
     prize_value: int = Field(ge=0, description="Valor del premio en MXN")
     price_min: int = Field(ge=1, description="Monto mínimo del boleto (MXN)")
     price_max: int = Field(ge=1, description="Monto máximo del boleto (MXN)")
-    draw_date: Optional[str] = None
-    notes: Optional[str] = None
-    meet_url: Optional[str] = None
-    max_tickets_per_person: int = Field(default=3, ge=0, description="0 = sin límite")
+    draw_date: Optional[str] = Field(default=None, max_length=10)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    meet_url: Optional[str] = Field(default=None, max_length=300)
+    max_tickets_per_person: int = Field(default=3, ge=0, le=200, description="0 = sin límite")
 
     @field_validator("draw_date")
     @classmethod
@@ -99,11 +99,19 @@ class RaffleUpdate(BaseModel):
     title: Optional[str] = Field(default=None, min_length=3, max_length=120)
     prize: Optional[str] = Field(default=None, min_length=3, max_length=300)
     prize_value: Optional[int] = Field(default=None, ge=0)
-    draw_date: Optional[str] = None
-    notes: Optional[str] = None
-    image_url: Optional[str] = None
-    meet_url: Optional[str] = None
-    max_tickets_per_person: Optional[int] = Field(default=None, ge=0)
+    draw_date: Optional[str] = Field(default=None, max_length=10)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    image_url: Optional[str] = Field(default=None, max_length=500)
+    meet_url: Optional[str] = Field(default=None, max_length=300)
+    max_tickets_per_person: Optional[int] = Field(default=None, ge=0, le=200)
+
+    @field_validator("image_url")
+    @classmethod
+    def _image(cls, v: Optional[str]) -> Optional[str]:
+        # Solo URLs https (las del panel vienen de Cloudinary); vacío = quitar la imagen
+        if v and not v.startswith("https://"):
+            raise ValueError("La imagen debe ser una URL https")
+        return v
 
     @field_validator("draw_date")
     @classmethod
@@ -231,7 +239,7 @@ class ReportPaidIn(BaseModel):
 class AccessCheckIn(BaseModel):
     folio: int = Field(ge=1)
     code: str = Field(min_length=3, max_length=12)
-    raffle_slug: str = Field(min_length=3)
+    raffle_slug: str = Field(min_length=3, max_length=80)
 
 
 class AccessCheckOut(BaseModel):
@@ -249,7 +257,7 @@ class AccessCheckOut(BaseModel):
 class RegisterIn(BaseModel):
     folio: int = Field(ge=1)
     code: str = Field(min_length=3, max_length=12)
-    raffle_slug: str = Field(min_length=3)
+    raffle_slug: str = Field(min_length=3, max_length=80)
     name: str = Field(min_length=3, max_length=120)
     phone: str = Field(min_length=10, max_length=20)
 
@@ -262,7 +270,7 @@ class RegisterIn(BaseModel):
 class ScratchIn(BaseModel):
     folio: int = Field(ge=1)
     code: str = Field(min_length=3, max_length=12)
-    raffle_slug: str = Field(min_length=3)
+    raffle_slug: str = Field(min_length=3, max_length=80)
 
 
 class ScratchOut(BaseModel):

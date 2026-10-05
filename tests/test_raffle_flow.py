@@ -551,3 +551,49 @@ def test_release_of_free_ticket_does_not_rotate_code_even_without_owner_check(cl
     code = db.tickets.find_one({"folio": 1})["access_code"]
     assert client.post(url, headers=admin).status_code == 400
     assert db.tickets.find_one({"folio": 1})["access_code"] == code
+
+
+# =====================================================================
+# LOTE 3: endurecimiento HTTP
+# =====================================================================
+def test_docs_are_closed_by_default(client):
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404
+
+
+def test_security_headers_present(client):
+    r = client.get("/health")
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["Referrer-Policy"] == "no-referrer"
+
+
+def test_oversized_body_rejected_before_parsing(client, raffle):
+    big = "x" * (1024 * 1024 + 10)
+    r = client.post(f"/api/v1/public/raffles/{raffle['slug']}/claim",
+                    content=('{"folio":1,"name":"' + big + '","phone":"5511223344"}').encode(),
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 413
+
+
+def test_long_strings_rejected(client, admin, raffle):
+    r = client.patch(f"/api/v1/raffles/{raffle['id']}", headers=admin, json={"notes": "x" * 5000})
+    assert r.status_code == 422
+    r = client.post("/api/v1/auth/login", json={"phone": "5500000000", "password": "x" * 500})
+    assert r.status_code == 422
+
+
+def test_image_url_must_be_https(client, admin, raffle):
+    rid = raffle["id"]
+    assert client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"image_url": "javascript:alert(1)"}).status_code == 422
+    ok = client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"image_url": "https://res.cloudinary.com/x/y.png"})
+    assert ok.status_code == 200
+
+
+def test_public_traffic_runs_maintenance_when_loop_is_asleep(client, db, raffle):
+    """Render free duerme el loop: la primera visita pública cierra el sorteo vencido."""
+    import app.main as m
+    db.raffles.update_one({"slug": raffle["slug"]}, {"$set": {"draw_date": "2020-01-01"}})
+    m._last_maintenance = 0.0
+    client.get(f"/api/v1/public/raffles/{raffle['slug']}")
+    assert db.raffles.find_one({"slug": raffle["slug"]})["status"] == "closed"

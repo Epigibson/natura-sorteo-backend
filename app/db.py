@@ -30,4 +30,4 @@ def ensure_indexes() -> None:
     db.tickets.create_index([("raffle_id", ASCENDING), ("folio", ASCENDING)], unique=True)
     db.tickets.create_index([("raffle_id", ASCENDING), ("status", ASCENDING)])
     db.tickets.create_index([("raffle_id", ASCENDING), ("participant.phone", ASCENDING)])
-    db.tickets.create_index([("access_code", ASCENDING)])
+    db.audit_log.create_index([("raffle_id", ASCENDING), ("at", DESCENDING)])

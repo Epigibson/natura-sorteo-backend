@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     timezone: str = "America/Mexico_City"
     proxy_hops: int = 2
 
+    # /docs, /redoc y /openapi.json: apagados salvo que se activen a propósito (dev)
+    enable_docs: bool = False
+
     # Horas sin pagar antes de liberar un boleto registrado/raspado
     auto_release_hours: int = 48
 
