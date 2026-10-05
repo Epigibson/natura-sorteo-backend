@@ -30,16 +30,9 @@ def seed_admin(db) -> None:
 
 
 def _local_today() -> str:
-    """Fecha de hoy (YYYY-MM-DD) en la zona horaria del sorteo, no en UTC."""
-    from datetime import datetime, timedelta, timezone
+    from app.services.raffle_service import local_today
 
-    try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo(get_settings().timezone)
-    except Exception:
-        tz = timezone(timedelta(hours=-6))  # México centro, sin horario de verano
-    return datetime.now(tz).strftime("%Y-%m-%d")
+    return local_today()
 
 
 def run_maintenance(db) -> None:

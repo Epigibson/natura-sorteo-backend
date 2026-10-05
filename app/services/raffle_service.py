@@ -23,6 +23,19 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def local_today() -> str:
+    """Fecha de hoy (YYYY-MM-DD) en la zona horaria del sorteo, no en UTC."""
+    from app.config import get_settings
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(get_settings().timezone)
+    except Exception:
+        tz = timezone(timedelta(hours=-6))  # México centro, sin horario de verano
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
 def oid(value: str) -> ObjectId:
     try:
         return ObjectId(value)
@@ -341,8 +354,23 @@ def entregar_boleto(
     return _serialize_ticket(doc)
 
 
+def _check_expected_owner(ticket: dict, expected_phone: str | None) -> None:
+    """La lista del dashboard puede estar desactualizada: si el boleto cambió de dueño desde
+    que se cargó, no se cobra ni se libera a la persona equivocada."""
+    if expected_phone is None:
+        return
+    current = digits((ticket.get("participant") or {}).get("phone"))
+    if current != digits(expected_phone):
+        raise ValueError("Este boleto cambió de dueño desde que cargaste la lista; recarga e inténtalo de nuevo")
+
+
 def marcar_pagado(
-    db: Database, raffle_id: str, folio: int, note: str | None = None, by: str | None = None
+    db: Database,
+    raffle_id: str,
+    folio: int,
+    note: str | None = None,
+    by: str | None = None,
+    expected_phone: str | None = None,
 ) -> dict | None:
     rid = oid(raffle_id)
     _ensure_not_drawn(_raffle_of(db, rid))
@@ -354,11 +382,13 @@ def marcar_pagado(
     p = ticket.get("participant") or {}
     if not p.get("name") or not p.get("phone"):
         raise ValueError("El boleto no tiene participante (nombre y teléfono); regístralo antes de cobrar")
+    _check_expected_owner(ticket, expected_phone)
 
     now = now_utc()
     doc = db.tickets.find_one_and_update(
-        # el filtro de estado evita pisar un cambio concurrente (p. ej. auto-liberado)
-        {"_id": ticket["_id"], "status": {"$in": ["delivered", "registered", "scratched"]}},
+        # estado + updated_at: si algo cambió el boleto tras leerlo (auto-liberado, otro dueño), no se cobra
+        {"_id": ticket["_id"], "status": {"$in": ["delivered", "registered", "scratched"]},
+         "updated_at": ticket["updated_at"]},
         {"$set": {"status": "paid", "paid_at": now, "updated_at": now, "payment_note": note, "paid_by": by}},
         return_document=ReturnDocument.AFTER,
     )
@@ -406,7 +436,9 @@ def desmarcar_pago(db: Database, raffle_id: str, folio: int, by: str | None = No
     return _serialize_ticket(doc)
 
 
-def liberar_boleto(db: Database, raffle_id: str, folio: int, by: str | None = None) -> dict | None:
+def liberar_boleto(
+    db: Database, raffle_id: str, folio: int, by: str | None = None, expected_phone: str | None = None
+) -> dict | None:
     rid = oid(raffle_id)
     _ensure_not_drawn(_raffle_of(db, rid))
     ticket = db.tickets.find_one({"raffle_id": rid, "folio": folio})
@@ -414,10 +446,14 @@ def liberar_boleto(db: Database, raffle_id: str, folio: int, by: str | None = No
         return None
     if ticket["status"] == "paid":
         raise ValueError("No se puede liberar un boleto pagado")
+    if ticket["status"] == "free":
+        # evita que un doble clic rote el código dos veces e invalide el enlace ya reenviado
+        raise ValueError("El boleto ya está libre")
+    _check_expected_owner(ticket, expected_phone)
 
     # Una sola operación atómica: libera y rota el código
     doc = db.tickets.find_one_and_update(
-        {"_id": ticket["_id"], "status": {"$ne": "paid"}},
+        {"_id": ticket["_id"], "status": {"$nin": ["paid", "free"]}, "updated_at": ticket["updated_at"]},
         {
             "$set": {
                 "status": "free",
@@ -433,7 +469,7 @@ def liberar_boleto(db: Database, raffle_id: str, folio: int, by: str | None = No
         return_document=ReturnDocument.AFTER,
     )
     if not doc:
-        raise ValueError("El boleto se pagó mientras se procesaba; no se liberó")
+        raise ValueError("El boleto cambió mientras se procesaba (¿se pagó o se liberó?); no se liberó")
     audit(db, "release", by=by, raffle_id=rid, folio=folio, previous=ticket.get("participant"), previous_status=ticket["status"])
     return _serialize_ticket(doc)
 

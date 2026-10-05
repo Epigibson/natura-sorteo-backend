@@ -171,6 +171,12 @@ class TicketAssign(BaseModel):
 
 class TicketPaidIn(BaseModel):
     note: Optional[str] = Field(default=None, max_length=300)
+    # Teléfono del titular que ve el dashboard: si ya cambió, el servidor rechaza el cobro
+    expected_phone: Optional[str] = Field(default=None, max_length=20)
+
+
+class TicketReleaseIn(BaseModel):
+    expected_phone: Optional[str] = Field(default=None, max_length=20)
 
 
 class TicketUnpayIn(BaseModel):

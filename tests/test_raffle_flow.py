@@ -462,3 +462,92 @@ def test_staff_assign_normalizes_phone_for_the_limit(client, admin, raffle):
     assert client.post(f"{base}/2/assign", headers=admin, json={"name": "Ana Pérez", "phone": "+52 55 1111 2222"}).status_code == 200
     r = client.post(f"{base}/3/assign", headers=admin, json={"name": "Ana Pérez", "phone": "525511112222"})
     assert r.status_code == 400  # límite 2: es la misma persona
+
+
+# =====================================================================
+# LOTE 2 (backend): edición, reabrir, cobros por dueño
+# =====================================================================
+def test_patch_can_clear_date_notes_and_image(client, admin, raffle):
+    rid = raffle["id"]
+    client.patch(f"/api/v1/raffles/{rid}", headers=admin,
+                 json={"draw_date": "2099-01-01", "notes": "algo", "image_url": "https://x/y.png"})
+    r = client.patch(f"/api/v1/raffles/{rid}", headers=admin,
+                     json={"draw_date": None, "notes": None, "image_url": None})
+    assert r.status_code == 200
+    got = r.json()
+    assert got["draw_date"] is None and got["notes"] is None and got["image_url"] is None
+
+
+def test_patch_omitted_fields_are_untouched_and_empty_patch_rejected(client, admin, raffle):
+    rid = raffle["id"]
+    client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"notes": "conservar"})
+    r = client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"prize": "Otro premio"})
+    assert r.json()["notes"] == "conservar" and r.json()["prize"] == "Otro premio"
+    assert client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={}).status_code == 400
+    # null en un campo obligatorio se ignora, no lo borra
+    r = client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"title": None, "notes": "x"})
+    assert r.json()["title"] == "Rifa Prueba"
+
+
+def test_reopen_closed_raffle(client, admin, raffle):
+    rid = raffle["id"]
+    client.post(f"/api/v1/raffles/{rid}/close", headers=admin)
+    r = client.post(f"/api/v1/raffles/{rid}/reopen", headers=admin)
+    assert r.status_code == 200 and r.json()["status"] == "open"
+    assert claim(client, raffle["slug"], 1).status_code == 200  # ya se puede vender otra vez
+    assert client.post(f"/api/v1/raffles/{rid}/reopen", headers=admin).status_code == 400  # ya estaba abierto
+
+
+def test_reopen_refused_when_date_already_passed_or_drawn(client, admin, db, raffle):
+    rid = raffle["id"]
+    client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"draw_date": "2020-01-01"})
+    client.post(f"/api/v1/raffles/{rid}/close", headers=admin)
+    r = client.post(f"/api/v1/raffles/{rid}/reopen", headers=admin)
+    assert r.status_code == 400 and "fecha" in r.json()["detail"]
+    client.patch(f"/api/v1/raffles/{rid}", headers=admin, json={"draw_date": None})
+    assert client.post(f"/api/v1/raffles/{rid}/reopen", headers=admin).status_code == 200  # sin fecha ya se puede
+    assert claim(client, raffle["slug"], 1).status_code == 200
+    assert pay(client, admin, rid, 1).status_code == 200
+    assert client.post(f"/api/v1/raffles/{rid}/draw", headers=admin).status_code == 200
+    assert client.post(f"/api/v1/raffles/{rid}/reopen", headers=admin).status_code == 400  # sorteado: nunca
+
+
+def test_pay_rejects_when_ticket_changed_owner(client, admin, raffle):
+    """El dashboard de Yuri tenía a Ana en el folio 1; Ana se soltó y María lo tomó."""
+    s, rid = raffle["slug"], raffle["id"]
+    claim(client, s, 1, phone="5511112222", name="Ana Pérez")
+    code = client.post(f"/api/v1/raffles/{rid}/tickets/1/release", headers=admin, json={}).json()["access_code"]
+    claim(client, s, 1, phone="5599887766", name="María López")
+    r = client.post(f"/api/v1/raffles/{rid}/tickets/1/pay", headers=admin, json={"expected_phone": "5511112222"})
+    assert r.status_code == 400 and "cambió de dueño" in r.json()["detail"]
+    ok = client.post(f"/api/v1/raffles/{rid}/tickets/1/pay", headers=admin, json={"expected_phone": "+52 55 9988 7766"})
+    assert ok.status_code == 200 and ok.json()["participant"]["name"] == "María López"
+
+
+def test_release_double_click_is_idempotent_and_owner_checked(client, admin, db, raffle):
+    s, rid = raffle["slug"], raffle["id"]
+    claim(client, s, 1)
+    wrong = client.post(f"/api/v1/raffles/{rid}/tickets/1/release", headers=admin, json={"expected_phone": "5500000099"})
+    assert wrong.status_code == 400
+    first = client.post(f"/api/v1/raffles/{rid}/tickets/1/release", headers=admin, json={"expected_phone": PHONE})
+    assert first.status_code == 200
+    code_after = db.tickets.find_one({"folio": 1})["access_code"]
+    second = client.post(f"/api/v1/raffles/{rid}/tickets/1/release", headers=admin, json={"expected_phone": PHONE})
+    assert second.status_code == 400
+    assert db.tickets.find_one({"folio": 1})["access_code"] == code_after  # no rotó otra vez
+
+
+def test_old_clients_without_expected_phone_still_work(client, admin, raffle):
+    claim(client, raffle["slug"], 1)
+    assert client.post(f"/api/v1/raffles/{raffle['id']}/tickets/1/pay", headers=admin, json={}).status_code == 200
+    claim(client, raffle["slug"], 2, phone="5599887766")
+    assert client.post(f"/api/v1/raffles/{raffle['id']}/tickets/2/release", headers=admin).status_code == 200
+
+
+def test_release_of_free_ticket_does_not_rotate_code_even_without_owner_check(client, admin, db, raffle):
+    claim(client, raffle["slug"], 1)
+    url = f"/api/v1/raffles/{raffle['id']}/tickets/1/release"
+    assert client.post(url, headers=admin).status_code == 200
+    code = db.tickets.find_one({"folio": 1})["access_code"]
+    assert client.post(url, headers=admin).status_code == 400
+    assert db.tickets.find_one({"folio": 1})["access_code"] == code

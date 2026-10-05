@@ -19,6 +19,7 @@ from app.schemas import (
     TicketAssign,
     TicketOut,
     TicketPaidIn,
+    TicketReleaseIn,
     TicketUnpayIn,
 )
 from app.security import (
@@ -166,7 +167,7 @@ def mark_paid(
     user: Annotated[CurrentUser, Depends(require_staff)],
 ) -> dict:
     try:
-        doc = rs.marcar_pagado(get_db(), raffle_id, folio, body.note, by=user["sub"])
+        doc = rs.marcar_pagado(get_db(), raffle_id, folio, body.note, by=user["sub"], expected_phone=body.expected_phone)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if not doc:
@@ -196,9 +197,13 @@ def release_ticket(
     raffle_id: str,
     folio: int,
     user: Annotated[CurrentUser, Depends(require_staff)],
+    body: Optional[TicketReleaseIn] = None,
 ) -> dict:
     try:
-        doc = rs.liberar_boleto(get_db(), raffle_id, folio, by=user["sub"])
+        doc = rs.liberar_boleto(
+            get_db(), raffle_id, folio, by=user["sub"],
+            expected_phone=body.expected_phone if body else None,
+        )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if not doc:
@@ -424,12 +429,19 @@ def update_raffle(
         raise HTTPException(400, "No se puede editar un sorteo ya sorteado")
 
     allowed = {}
+    sent = body.model_fields_set  # distingue "no enviado" de "enviado vacío (null)"
+    clearable = ("draw_date", "notes", "image_url")
     for field in ("title", "prize", "prize_value", "draw_date", "notes", "image_url", "meet_url", "max_tickets_per_person"):
+        if field not in sent:
+            continue
         val = getattr(body, field, None)
-        if val is not None:
-            if field == "meet_url":
-                val = rs.normalize_meet_url(val)
-            allowed[field] = val
+        if val is None:
+            if field in clearable:
+                allowed[field] = None  # el usuario vació el campo: se borra de verdad
+            continue
+        if field == "meet_url":
+            val = rs.normalize_meet_url(val)
+        allowed[field] = val
     if not allowed:
         raise HTTPException(400, "Nada que actualizar")
     allowed["updated_at"] = datetime.now(timezone.utc)
@@ -437,6 +449,33 @@ def update_raffle(
     db.raffles.update_one({"_id": doc["_id"]}, {"$set": allowed})
     result = rs.get_raffle(db, raffle_id)
     return result
+
+
+@router.post("/raffles/{raffle_id}/reopen", response_model=RaffleOut)
+def reopen_raffle(
+    raffle_id: str,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    """Reabre la venta de un sorteo cerrado (cierre por error o fecha mal puesta)."""
+    from bson import ObjectId
+
+    db = get_db()
+    try:
+        doc = db.raffles.find_one({"_id": ObjectId(raffle_id)})
+    except Exception:
+        raise HTTPException(400, "ID inválido")
+    if not doc:
+        raise HTTPException(404, "Sorteo no encontrado")
+    if doc.get("status") != "closed":
+        raise HTTPException(400, "Solo se puede reabrir un sorteo cerrado")
+    # Si la fecha ya llegó, el cierre automático lo volvería a cerrar en minutos
+    if doc.get("draw_date") and doc["draw_date"] <= rs.local_today():
+        raise HTTPException(400, "La fecha del sorteo ya llegó; cámbiala por una futura antes de reabrir la venta")
+    res = db.raffles.update_one({"_id": doc["_id"], "status": "closed"}, {"$set": {"status": "open"}})
+    if res.modified_count == 0:
+        raise HTTPException(400, "El sorteo cambió de estado; recarga e inténtalo de nuevo")
+    rs.audit(db, "reopen", by=user["sub"], raffle_id=doc["_id"])
+    return rs.get_raffle(db, raffle_id)
 
 
 # ---------- Historial global de participantes ----------
