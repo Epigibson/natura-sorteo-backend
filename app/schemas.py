@@ -70,6 +70,17 @@ class ChangePasswordIn(BaseModel):
         return v
 
 
+# ---------- Ajustes globales ----------
+class AppSettingsIn(BaseModel):
+    auto_release_enabled: bool = True
+    auto_release_hours: int = Field(default=48, ge=0, le=8760)
+
+
+class AppSettingsOut(BaseModel):
+    auto_release_enabled: bool
+    auto_release_hours: int
+
+
 # ---------- Raffle ----------
 class RaffleCreate(BaseModel):
     title: str = Field(min_length=3, max_length=120)

@@ -678,3 +678,73 @@ def test_board_after_draw_shows_exact_draw_list(client, admin, db, raffle):
     b = client.get(f"/api/v1/public/raffles/{s}/board").json()
     assert b["participating_folios"] == [1, 2]  # la lista que se usó, no la de ahora
     assert b["drawn_at"] and b["winner_folio"] in (1, 2)
+
+
+# ---------- ajustes globales (auto-liberación) ----------
+def _login_collab(client, db) -> dict:
+    from app.security import hash_password
+
+    db.users.insert_one({
+        "phone": "5511112222", "name": "Ayudante",
+        "password_hash": hash_password("TestPassword123!"),
+        "role": "collab", "active": True,
+    })
+    r = client.post("/api/v1/auth/login", json={"phone": "5511112222", "password": "TestPassword123!"})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+def test_settings_roundtrip(client, admin):
+    r = client.get("/api/v1/settings", headers=admin)
+    assert r.status_code == 200
+    assert r.json() == {"auto_release_enabled": True, "auto_release_hours": 48}  # respaldo de env
+
+    r = client.put("/api/v1/settings", headers=admin,
+                   json={"auto_release_enabled": False, "auto_release_hours": 12})
+    assert r.status_code == 200
+    assert r.json() == {"auto_release_enabled": False, "auto_release_hours": 12}
+    assert client.get("/api/v1/settings", headers=admin).json() == r.json()
+
+
+def test_settings_rejects_non_admin(client, db):
+    collab = _login_collab(client, db)
+    assert client.get("/api/v1/settings", headers=collab).status_code == 403
+    assert client.put("/api/v1/settings", headers=collab,
+                      json={"auto_release_enabled": False, "auto_release_hours": 12}).status_code == 403
+    assert client.get("/api/v1/settings").status_code == 401  # sin token
+
+
+def test_settings_rejects_out_of_range_hours(client, admin):
+    r = client.put("/api/v1/settings", headers=admin,
+                   json={"auto_release_enabled": True, "auto_release_hours": -1})
+    assert r.status_code == 422
+
+
+def test_auto_release_disabled_keeps_tickets(client, admin, db, raffle):
+    claim(client, raffle["slug"], 1)
+    _age(db, 1, hours=100)
+    client.put("/api/v1/settings", headers=admin,
+               json={"auto_release_enabled": False, "auto_release_hours": 48})
+    run_maintenance(db)
+    assert db.tickets.find_one({"folio": 1})["status"] == "registered"
+    assert db.audit_log.count_documents({"action": "auto_release"}) == 0
+
+
+def test_auto_release_hours_comes_from_settings(client, admin, db, raffle):
+    claim(client, raffle["slug"], 1)
+    claim(client, raffle["slug"], 2, phone="5599887766")
+    client.put("/api/v1/settings", headers=admin,
+               json={"auto_release_enabled": True, "auto_release_hours": 24})
+    _age(db, 1, hours=25)  # pasa el plazo configurado
+    _age(db, 2, hours=23)  # todavía no
+    run_maintenance(db)
+    assert db.tickets.find_one({"folio": 1})["status"] == "free"
+    assert db.tickets.find_one({"folio": 2})["status"] == "registered"
+
+
+def test_settings_change_is_audited(client, admin, db):
+    client.put("/api/v1/settings", headers=admin,
+               json={"auto_release_enabled": True, "auto_release_hours": 6})
+    doc = db.audit_log.find_one({"action": "settings_update"})
+    assert doc and doc["previous"]["auto_release_hours"] == 48
+    assert doc["current"]["auto_release_hours"] == 6

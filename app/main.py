@@ -40,6 +40,7 @@ def run_maintenance(db) -> None:
     """Cierra sorteos vencidos y libera boletos sin pagar. Es idempotente y atómico por boleto."""
     from datetime import datetime, timedelta, timezone
 
+    from app.services import app_settings as aps
     from app.services import raffle_service as rs
 
     now = datetime.now(timezone.utc)
@@ -56,7 +57,8 @@ def run_maintenance(db) -> None:
 
     # Auto-liberar boletos sin pagar tras N horas. Solo en sorteos ABIERTOS: una vez cerrada la
     # venta nadie podría volver a registrarse, y perder un boleto ya pagado sería irreparable.
-    hours = get_settings().auto_release_hours
+    cfg = aps.get_app_settings(db)
+    hours = cfg["auto_release_hours"] if cfg["auto_release_enabled"] else 0
     if hours <= 0:
         return
     cutoff = now - timedelta(hours=hours)

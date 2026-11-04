@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 
 from app.db import get_db
 from app.schemas import (
+    AppSettingsIn,
+    AppSettingsOut,
     ChangePasswordIn,
     RaffleCreate,
     RaffleUpdate,
@@ -30,6 +32,7 @@ from app.security import (
     require_staff,
 )
 from app.services import raffle_service as rs
+from app.services import app_settings as aps
 
 router = APIRouter(prefix="/api/v1", tags=["staff"])
 
@@ -81,6 +84,27 @@ def change_password(
         "access_token": create_access_token(sub=user["sub"], role=new.get("role", "collab"), name=new.get("name", ""), tv=tv),
         "refresh_token": create_refresh_token(sub=user["sub"], role=new.get("role", "collab"), tv=tv),
     }
+
+
+# ---------- Ajustes globales ----------
+@router.get("/settings", response_model=AppSettingsOut)
+def read_app_settings(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    return aps.get_app_settings(get_db())
+
+
+@router.put("/settings", response_model=AppSettingsOut)
+def update_app_settings(
+    body: AppSettingsIn,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    """Guarda los ajustes globales. Solo admin: cambian la política de todo el panel."""
+    db = get_db()
+    before = aps.get_app_settings(db)
+    after = aps.save_app_settings(db, body.model_dump())
+    rs.audit(db, "settings_update", by=user.get("sub"), previous=before, current=after)
+    return after
 
 
 # ---------- Sorteos ----------
