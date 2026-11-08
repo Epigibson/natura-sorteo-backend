@@ -4,12 +4,14 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 from typing import Any
+from uuid import uuid4
 
 import httpx
+from pymongo import ReturnDocument
 from pymongo.database import Database
 
 from app.config import get_settings
-from app.services.raffle_service import audit, digits, get_raffle, now_utc, oid
+from app.services.raffle_service import digits, get_raffle, now_utc, oid
 
 MASS_REMIND_ACTION = "mass_remind"
 COOLDOWN_HOURS = 24
@@ -80,6 +82,40 @@ def _require_config() -> tuple[str, str, str]:
     return s.evolution_url, s.evolution_api_key, s.evolution_instance
 
 
+def _claim_cooldown(db: Database, raffle_id: str, *, by: str, moment: Any, cutoff: Any) -> Any:
+    """Reclama el lock de cooldown ANTES del lote (check+insert en una sola operación
+    atómica): una segunda petición concurrente ve la fila `pending` y recibe el error
+    de 24 h en lugar de enviar el lote otra vez. Devuelve el `_id` de la fila-lock."""
+    claim_id = uuid4().hex
+    doc = db.audit_log.find_one_and_update(
+        {
+            "action": MASS_REMIND_ACTION,
+            "raffle_id": str(raffle_id),
+            "at": {"$gte": cutoff},
+        },
+        {
+            "$setOnInsert": {
+                "at": moment,
+                "action": MASS_REMIND_ACTION,
+                "by": by,
+                "raffle_id": str(raffle_id),
+                "folio": None,
+                "sent": 0,
+                "failed": 0,
+                "recipients": 0,
+                "skipped_no_phone": 0,
+                "status": "pending",
+                "claim_id": claim_id,
+            }
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    if doc.get("claim_id") != claim_id:
+        raise ValueError(f"Ya se envió un recordatorio en las últimas {COOLDOWN_HOURS} horas")
+    return doc["_id"]
+
+
 def send_mass_remind(
     db: Database,
     raffle_id: str,
@@ -100,16 +136,14 @@ def send_mass_remind(
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=now_utc().tzinfo)
     cutoff = moment - timedelta(hours=COOLDOWN_HOURS)
-    prior = db.audit_log.find_one({
-        "action": MASS_REMIND_ACTION,
-        "raffle_id": str(raffle_id),
-        "at": {"$gte": cutoff},
-    })
-    if prior:
-        raise ValueError(f"Ya se envió un recordatorio en las últimas {COOLDOWN_HOURS} horas")
+
+    # 1) Reclama el lock de cooldown antes de cualquier envío (evita TOCTOU entre
+    #    peticiones concurrentes durante el lote).
+    lock_id = _claim_cooldown(db, raffle_id, by=by, moment=moment, cutoff=cutoff)
 
     phones = collect_unique_phones(db, raffle_id)
     if not phones:
+        db.audit_log.delete_one({"_id": lock_id})
         raise ValueError("No hay participantes con teléfono")
 
     message = build_reminder_message(raffle, base_url)
@@ -128,10 +162,29 @@ def send_mass_remind(
 
     skipped_no_phone = _count_skipped_no_phone(db, raffle_id)
     recipients = len(phones)
-    audit(
-        db, MASS_REMIND_ACTION, by=by, raffle_id=raffle_id,
-        sent=sent, failed=failed, recipients=recipients,
-        skipped_no_phone=skipped_no_phone,
+
+    # 2) sent==0 → nada entregado: libera el lock para permitir reintento cuando
+    #    Evolution vuelva; no deja cooldown de 24 h con cero mensajes.
+    if sent == 0:
+        db.audit_log.delete_one({"_id": lock_id})
+        raise ValueError(
+            f"No se envió ningún recordatorio ({failed} de {recipients} fallos); "
+            "revisa Evolution API e inténtalo de nuevo"
+        )
+
+    # 3) sent>0 → finaliza la misma fila-lock como bitácora definitiva del envío.
+    db.audit_log.update_one(
+        {"_id": lock_id},
+        {
+            "$set": {
+                "sent": sent,
+                "failed": failed,
+                "recipients": recipients,
+                "skipped_no_phone": skipped_no_phone,
+                "status": "completed",
+            },
+            "$unset": {"claim_id": ""},
+        },
     )
     return {
         "sent": sent,

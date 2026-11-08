@@ -233,3 +233,83 @@ def test_mass_remind_forbidden_without_admin(client, raffle):
     # sin token: 401; con require_admin cualquier no-admin da 403
     r = client.post(f"/api/v1/raffles/{raffle['id']}/remind", json={"base_url": "https://e.test"})
     assert r.status_code in (401, 403)
+
+
+# ---------- hallazgos: cooldown atómico + permisos/config por endpoint ----------
+
+
+def _login_collab(client, db) -> dict:
+    """Collab de prueba (mismo patrón que tests/test_raffle_flow.py::_login_collab)."""
+    from app.security import hash_password
+
+    db.users.insert_one({
+        "phone": "5511112222", "name": "Ayudante",
+        "password_hash": hash_password("TestPassword123!"),
+        "role": "collab", "active": True,
+    })
+    r = client.post("/api/v1/auth/login", json={"phone": "5511112222", "password": "TestPassword123!"})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+def test_mass_remind_forbidden_for_collab(client, db, raffle):
+    collab = _login_collab(client, db)
+    r = client.post(f"/api/v1/raffles/{raffle['id']}/remind", headers=collab,
+                    json={"base_url": "https://e.test"})
+    assert r.status_code == 403
+
+
+def test_mass_remind_endpoint_requires_evolution_config(client, admin, db, raffle, monkeypatch):
+    monkeypatch.setattr(wr, "get_settings", lambda: _settings(url=""))
+    r = client.post(f"/api/v1/raffles/{raffle['id']}/remind", headers=admin,
+                    json={"base_url": "https://e.test"})
+    assert r.status_code == 400
+    assert "configurado" in r.json()["detail"]
+
+
+def test_mass_remind_claims_lock_before_batch(db, raffle, monkeypatch):
+    """El lock de cooldown se reclama ANTES del lote: una llamada concurrente
+    durante el envío ve la fila pending y recibe el error de 24 h (sin TOCTOU)."""
+    from app.services import raffle_service as rs
+
+    monkeypatch.setattr(wr, "get_settings", lambda: _settings())
+    rid = raffle["id"]
+    rs.entregar_boleto(db, rid, 1, name="Ana", phone="5511223344")
+    rs.entregar_boleto(db, rid, 2, name="Beto", phone="5599887766")
+
+    def reentrant(**kw):
+        # segunda petición "concurrente" dispara justo cuando corre el primer envío
+        with pytest.raises(ValueError, match="24 horas"):
+            wr.send_mass_remind(db, rid, by="otro-admin", base_url="https://e.test")
+
+    monkeypatch.setattr(wr, "send_text_evolution", reentrant)
+    monkeypatch.setattr(wr.time, "sleep", lambda s: None)
+    out = wr.send_mass_remind(db, rid, by="admin", base_url="https://e.test")
+    assert out["sent"] == 2
+    row = db.audit_log.find_one({"action": "mass_remind", "raffle_id": str(rid)})
+    assert row and row["status"] == "completed" and row["sent"] == 2
+    assert "claim_id" not in row
+
+
+def test_mass_remind_all_failed_releases_cooldown(client, admin, db, raffle, monkeypatch):
+    """Si sent==0 no se deja lock de 24 h: se libera y el reintento funciona."""
+    rid = raffle["id"]
+    client.post(f"/api/v1/raffles/{rid}/tickets/1/assign", headers=admin,
+                json={"name": "Ana", "phone": "5511223344"})
+    monkeypatch.setattr(wr, "get_settings", lambda: _settings())
+    monkeypatch.setattr(wr.time, "sleep", lambda s: None)
+
+    def boom(**kw):
+        raise RuntimeError("Evolution caído")
+
+    monkeypatch.setattr(wr, "send_text_evolution", boom)
+    with pytest.raises(ValueError, match="recordatorio"):
+        wr.send_mass_remind(db, rid, by="admin", base_url="https://e.test")
+    assert not any(a["action"] == "mass_remind" for a in db.audit_log.find())
+
+    # reintento inmediato permitido cuando Evolution vuelve
+    monkeypatch.setattr(wr, "send_text_evolution", lambda **kw: None)
+    out = wr.send_mass_remind(db, rid, by="admin", base_url="https://e.test")
+    assert out["sent"] == 1
+    row = db.audit_log.find_one({"action": "mass_remind", "raffle_id": str(rid)})
+    assert row and row["status"] == "completed"
