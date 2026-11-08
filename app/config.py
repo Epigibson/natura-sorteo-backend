@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     # Enlace de videollamada reutilizable (la misma sala para todos los sorteos)
     default_meet_url: str = "https://meet.google.com/hea-kbvn-hja"
 
+    # Evolution API (WhatsApp) — vacío = envío masivo deshabilitado
+    evolution_url: str = ""
+    evolution_api_key: str = ""
+    evolution_instance: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
