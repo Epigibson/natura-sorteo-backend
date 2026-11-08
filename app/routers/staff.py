@@ -18,6 +18,8 @@ from app.schemas import (
     RaffleUpdate,
     RaffleOut,
     RaffleStats,
+    RemindIn,
+    RemindOut,
     TicketAssign,
     TicketOut,
     TicketPaidIn,
@@ -253,6 +255,21 @@ def draw(
 ) -> dict:
     try:
         return rs.run_draw(get_db(), raffle_id, by=user["sub"])
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/remind", response_model=RemindOut)
+def mass_remind(
+    raffle_id: str,
+    body: RemindIn,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    from app.services import whatsapp_reminder as wrm
+    try:
+        return wrm.send_mass_remind(
+            get_db(), raffle_id, by=user["sub"], base_url=body.base_url.rstrip("/")
+        )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 

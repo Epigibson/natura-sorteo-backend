@@ -308,3 +308,15 @@ class PublicRaffleOut(BaseModel):
     drawn: bool
     winner_folio: Optional[int] = None
     winner_name: Optional[str] = None
+
+
+# ---------- Recordatorio masivo WhatsApp ----------
+class RemindIn(BaseModel):
+    base_url: str = Field(min_length=1, max_length=500)
+
+
+class RemindOut(BaseModel):
+    sent: int
+    failed: int
+    skipped_no_phone: int
+    recipients: int

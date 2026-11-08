@@ -211,3 +211,25 @@ def test_constants():
     assert wr.MASS_REMIND_ACTION == "mass_remind"
     assert wr.COOLDOWN_HOURS == 24
     assert wr.DELAY_SECONDS == 1.5
+
+
+def test_mass_remind_endpoint_admin_ok(client, admin, db, raffle, monkeypatch):
+    import app.services.whatsapp_reminder as wr
+    rid = raffle["id"]
+    client.post(f"/api/v1/raffles/{rid}/tickets/1/assign", headers=admin,
+                json={"name": "Ana", "phone": "5511223344"})
+    monkeypatch.setattr(wr, "get_settings", lambda: type("S", (), {
+        "evolution_url": "http://evo:8080", "evolution_api_key": "k",
+        "evolution_instance": "i"})())
+    monkeypatch.setattr(wr, "send_text_evolution", lambda **kw: None)
+    monkeypatch.setattr("app.services.whatsapp_reminder.time.sleep", lambda s: None)
+    r = client.post(f"/api/v1/raffles/{rid}/remind", headers=admin,
+                    json={"base_url": "https://e.test"})
+    assert r.status_code == 200
+    assert r.json()["sent"] == 1
+
+
+def test_mass_remind_forbidden_without_admin(client, raffle):
+    # sin token: 401; con require_admin cualquier no-admin da 403
+    r = client.post(f"/api/v1/raffles/{raffle['id']}/remind", json={"base_url": "https://e.test"})
+    assert r.status_code in (401, 403)
