@@ -81,6 +81,27 @@ class AppSettingsOut(BaseModel):
     auto_release_hours: int
 
 
+class MarketingSettingsIn(BaseModel):
+    auto_wa_on_pay: bool = True
+    auto_wa_on_draw: bool = True
+    auto_fb_on_create: bool = False
+    auto_fb_milestones: bool = True
+    public_base_url: str = Field(default="", max_length=300)
+    fb_page_id: str = Field(default="", max_length=80)
+    fb_page_access_token: Optional[str] = Field(default=None, max_length=500)
+
+
+class MarketingSettingsOut(BaseModel):
+    auto_wa_on_pay: bool = True
+    auto_wa_on_draw: bool = True
+    auto_fb_on_create: bool = False
+    auto_fb_milestones: bool = True
+    public_base_url: str = ""
+    fb_page_id: str = ""
+    fb_token_configured: bool = False
+    evolution_configured: bool = False
+
+
 # ---------- Raffle ----------
 class RaffleCreate(BaseModel):
     title: str = Field(min_length=3, max_length=120)
@@ -320,3 +341,20 @@ class RemindOut(BaseModel):
     failed: int
     skipped_no_phone: int
     recipients: int
+
+
+# ---------- Marketing y Automatización ----------
+class MarketingActionIn(BaseModel):
+    base_url: str = Field(default="", max_length=500)
+
+
+class PostDrawCampaignIn(BaseModel):
+    base_url: str = Field(default="", max_length=500)
+    bonus_amount: int = Field(default=30, ge=1, le=5000)
+    min_order: int = Field(default=350, ge=0, le=50000)
+
+
+class FacebookPublishIn(BaseModel):
+    kind: Literal["launch", "milestone_50", "milestone_80", "winner"] = "launch"
+    base_url: str = Field(default="", max_length=500)
+    force: bool = False

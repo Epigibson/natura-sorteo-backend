@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app.db import get_db
@@ -14,6 +14,11 @@ from app.schemas import (
     AppSettingsIn,
     AppSettingsOut,
     ChangePasswordIn,
+    FacebookPublishIn,
+    MarketingActionIn,
+    MarketingSettingsIn,
+    MarketingSettingsOut,
+    PostDrawCampaignIn,
     RaffleCreate,
     RaffleUpdate,
     RaffleOut,
@@ -35,8 +40,17 @@ from app.security import (
 )
 from app.services import raffle_service as rs
 from app.services import app_settings as aps
+from app.services import facebook_publisher as fbp
+from app.services import marketing_service as mks
 
 router = APIRouter(prefix="/api/v1", tags=["staff"])
+
+
+def _origin_from_request(request: Request) -> str:
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    if origin:
+        return origin
+    return ""
 
 
 @router.get("/me")
@@ -109,6 +123,24 @@ def update_app_settings(
     return after
 
 
+@router.get("/marketing/settings", response_model=MarketingSettingsOut)
+def read_marketing_settings(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    return aps.get_marketing_settings(get_db())
+
+
+@router.put("/marketing/settings", response_model=MarketingSettingsOut)
+def update_marketing_settings(
+    body: MarketingSettingsIn,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    db = get_db()
+    after = aps.save_marketing_settings(db, body.model_dump())
+    rs.audit(db, "marketing_settings_update", by=user.get("sub"))
+    return after
+
+
 # ---------- Sorteos ----------
 @router.get("/raffles", response_model=list[RaffleOut])
 def list_raffles(user: Annotated[CurrentUser, Depends(require_staff)]) -> list[dict]:
@@ -118,11 +150,14 @@ def list_raffles(user: Annotated[CurrentUser, Depends(require_staff)]) -> list[d
 @router.post("/raffles", response_model=RaffleOut, status_code=status.HTTP_201_CREATED)
 def create_raffle(
     body: RaffleCreate,
+    request: Request,
+    background_tasks: BackgroundTasks,
     user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> dict:
+    db = get_db()
     try:
-        return rs.crear_sorteo(
-            get_db(),
+        created = rs.crear_sorteo(
+            db,
             title=body.title,
             prize=body.prize,
             prize_value=body.prize_value,
@@ -135,6 +170,16 @@ def create_raffle(
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    if created.get("status") == "open":
+        background_tasks.add_task(
+            fbp.safe_auto_publish_event,
+            db,
+            created["id"],
+            kind="launch",
+            base_url=_origin_from_request(request),
+            by=user["sub"],
+        )
+    return created
 
 
 @router.get("/raffles/{raffle_id}", response_model=RaffleOut)
@@ -190,14 +235,20 @@ def mark_paid(
     raffle_id: str,
     folio: int,
     body: TicketPaidIn,
+    request: Request,
+    background_tasks: BackgroundTasks,
     user: Annotated[CurrentUser, Depends(require_staff)],
 ) -> dict:
+    db = get_db()
     try:
-        doc = rs.marcar_pagado(get_db(), raffle_id, folio, body.note, by=user["sub"], expected_phone=body.expected_phone)
+        doc = rs.marcar_pagado(db, raffle_id, folio, body.note, by=user["sub"], expected_phone=body.expected_phone)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if not doc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Boleto no encontrado")
+    origin = _origin_from_request(request)
+    background_tasks.add_task(mks.safe_notify_payment_confirmed, db, raffle_id, doc, base_url=origin)
+    background_tasks.add_task(fbp.check_and_publish_milestone, db, raffle_id, base_url=origin, by=user["sub"])
     return doc
 
 
@@ -251,12 +302,21 @@ def close_raffle(
 @router.post("/raffles/{raffle_id}/draw")
 def draw(
     raffle_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> dict:
+    db = get_db()
     try:
-        return rs.run_draw(get_db(), raffle_id, by=user["sub"])
+        res = rs.run_draw(db, raffle_id, by=user["sub"])
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    origin = _origin_from_request(request)
+    background_tasks.add_task(mks.safe_auto_post_draw, db, raffle_id, base_url=origin)
+    background_tasks.add_task(
+        fbp.safe_auto_publish_event, db, raffle_id, kind="winner", base_url=origin, by=user["sub"]
+    )
+    return res
 
 
 @router.post("/raffles/{raffle_id}/remind", response_model=RemindOut)
@@ -271,6 +331,117 @@ def mass_remind(
             get_db(), raffle_id, by=user["sub"], base_url=body.base_url.rstrip("/")
         )
     except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+# ---------- Marketing y Automatización ----------
+@router.get("/raffles/{raffle_id}/marketing/status")
+def marketing_status(
+    raffle_id: str,
+    user: Annotated[CurrentUser, Depends(require_staff)],
+) -> dict:
+    db = get_db()
+    if not rs.get_raffle(db, raffle_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Sorteo no encontrado")
+    settings = aps.get_marketing_settings(db)
+    unpaid_phones: set[str] = set()
+    for t in db.tickets.find(
+        {"raffle_id": rs.oid(raffle_id), "status": {"$in": ["delivered", "registered", "scratched"]}},
+        {"participant.phone": 1},
+    ):
+        d = rs.digits((t.get("participant") or {}).get("phone"))
+        if len(d) == 10:
+            unpaid_phones.add(d)
+    fb_posts = [
+        row.get("kind")
+        for row in db.audit_log.find(
+            {"action": fbp.FB_PUBLISH_ACTION, "raffle_id": str(raffle_id), "status": "ok"},
+            {"kind": 1},
+        )
+        if row.get("kind")
+    ]
+    return {
+        "past_participants_count": len(mks.collect_past_participant_phones(db, raffle_id)),
+        "unpaid_with_phone_count": len(unpaid_phones),
+        "fb_posts": sorted(set(fb_posts)),
+        "fb_configured": bool(settings.get("fb_page_id") and settings.get("fb_token_configured")),
+        "evolution_configured": bool(settings.get("evolution_configured")),
+    }
+
+
+@router.post("/raffles/{raffle_id}/marketing/remind-unpaid", response_model=RemindOut)
+def marketing_remind_unpaid(
+    raffle_id: str,
+    body: MarketingActionIn,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return mks.send_unpaid_reminders(
+            get_db(),
+            raffle_id,
+            by=user["sub"],
+            base_url=body.base_url or _origin_from_request(request),
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/marketing/invite-past", response_model=RemindOut)
+def marketing_invite_past(
+    raffle_id: str,
+    body: MarketingActionIn,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return mks.send_past_participants_invite(
+            get_db(),
+            raffle_id,
+            by=user["sub"],
+            base_url=body.base_url or _origin_from_request(request),
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/marketing/post-draw", response_model=RemindOut)
+def marketing_post_draw(
+    raffle_id: str,
+    body: PostDrawCampaignIn,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return mks.send_post_draw_campaign(
+            get_db(),
+            raffle_id,
+            by=user["sub"],
+            base_url=body.base_url or _origin_from_request(request),
+            bonus_amount=body.bonus_amount,
+            min_order=body.min_order,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/marketing/facebook")
+def marketing_publish_facebook(
+    raffle_id: str,
+    body: FacebookPublishIn,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return fbp.publish_raffle_post(
+            get_db(),
+            raffle_id,
+            kind=body.kind,
+            base_url=body.base_url or _origin_from_request(request),
+            by=user["sub"],
+            force=body.force,
+        )
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 
 

@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     evolution_api_key: str = ""
     evolution_instance: str = ""
 
+    # Meta Graph API (Página de Facebook) — vacío = auto-publicación deshabilitada
+    fb_page_id: str = ""
+    fb_page_access_token: str = ""
+    public_base_url: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
