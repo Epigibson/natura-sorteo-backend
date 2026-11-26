@@ -57,17 +57,22 @@ def _send_batch(
             consecutive_errors = 0
         except Exception as exc:
             failed += 1
-            consecutive_errors += 1
             err_txt = str(exc).lower()
-            if stop_on_disconnect and (
-                "428" in err_txt
-                or "connection closed" in err_txt
-                or "404" in err_txt
-                or consecutive_errors >= 3
-            ):
-                # Cuenta los restantes como no enviados y corta para no quemar el número
-                failed += len(phones) - i - 1
-                break
+            is_bad_number = "http 400" in err_txt and "connection closed" not in err_txt
+            if is_bad_number:
+                # Número inválido o sin WhatsApp: no cuenta como caída de sesión
+                consecutive_errors = 0
+            else:
+                consecutive_errors += 1
+                if stop_on_disconnect and (
+                    "428" in err_txt
+                    or "connection closed" in err_txt
+                    or "404" in err_txt
+                    or "401" in err_txt
+                    or consecutive_errors >= 3
+                ):
+                    failed += len(phones) - i - 1
+                    break
         if i < len(phones) - 1 and delay > 0:
             time.sleep(delay)
     return sent, failed

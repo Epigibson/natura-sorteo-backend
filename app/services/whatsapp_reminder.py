@@ -61,15 +61,28 @@ def wa_jid(phone_10: str) -> str:
 
 def send_text_evolution(*, url: str, api_key: str, instance: str, jid: str, text: str) -> None:
     endpoint = f"{url.rstrip('/')}/message/sendText/{instance}"
-    try:
+
+    def _post(target_jid: str) -> None:
         r = httpx.post(
             endpoint,
             headers={"apikey": api_key},
-            json={"number": jid, "text": text},
+            json={"number": target_jid, "text": text},
             timeout=30,
         )
         r.raise_for_status()
+
+    try:
+        _post(jid)
     except httpx.HTTPStatusError as exc:
+        # En México muchos números fuera de caché requieren prefijo 521 en lugar de 52
+        if exc.response.status_code == 400 and len(jid) == 12 and jid.startswith("52"):
+            try:
+                _post("521" + jid[2:])
+                return
+            except httpx.HTTPStatusError as exc2:
+                raise RuntimeError(f"Evolution HTTP {exc2.response.status_code}") from exc2
+            except httpx.HTTPError as exc2:
+                raise RuntimeError(f"Evolution error: {exc2}") from exc2
         raise RuntimeError(f"Evolution HTTP {exc.response.status_code}") from exc
     except httpx.HTTPError as exc:
         raise RuntimeError(f"Evolution error: {exc}") from exc

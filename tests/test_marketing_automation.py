@@ -164,6 +164,29 @@ def test_send_batch_stops_early_on_428_disconnect(monkeypatch):
     assert len(calls) == 2
 
 
+def test_send_batch_does_not_abort_on_http_400_bad_numbers(monkeypatch):
+    calls = []
+
+    def fake_send(**kw):
+        calls.append(kw["jid"])
+        if kw["jid"] in ("521111111111", "521222222222", "521333333333"):
+            raise RuntimeError("Evolution HTTP 400")
+
+    monkeypatch.setattr(wr, "get_settings", lambda: _evo_settings())
+    monkeypatch.setattr(wr, "send_text_evolution", fake_send)
+    monkeypatch.setattr(wr.time, "sleep", lambda s: None)
+
+    sent, failed = mks._send_batch(
+        ["1111111111", "1222222222", "1333333333", "5544444444"],
+        "Hola",
+        delay_seconds=0,
+        stop_on_disconnect=True,
+    )
+    assert sent == 1
+    assert failed == 3
+    assert len(calls) == 4
+
+
 def test_facebook_publish_and_milestone_auto_trigger(client, admin, db, monkeypatch):
     # Configurar FB desde settings API y verificar que token no se filtra en GET
     put = client.put(
