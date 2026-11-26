@@ -341,6 +341,7 @@ class RemindOut(BaseModel):
     failed: int
     skipped_no_phone: int
     recipients: int
+    remaining: int = 0
 
 
 # ---------- Marketing y Automatización ----------

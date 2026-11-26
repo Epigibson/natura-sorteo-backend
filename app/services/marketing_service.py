@@ -18,8 +18,9 @@ UNPAID_REMIND_ACTION = "unpaid_remind"
 POST_DRAW_ACTION = "post_draw_campaign"
 PAST_INVITE_ACTION = "past_invite"
 UNPAID_COOLDOWN_HOURS = 12
-PAST_INVITE_COOLDOWN_HOURS = 24
-PAST_INVITE_DELAY_SECONDS = 4.5
+PAST_INVITE_COOLDOWN_MINUTES = 2
+PAST_INVITE_BATCH_SIZE = 12
+PAST_INVITE_DELAY_SECONDS = 4.0
 
 
 def _effective_base_url(db: Database, base_url: str) -> str:
@@ -78,13 +79,16 @@ def _claim_window_lock(
     action: str,
     raffle_id: str,
     by: str,
-    cooldown_hours: int | None,
+    cooldown_hours: int | None = None,
+    cooldown_minutes: int | None = None,
 ) -> Any:
     """Reclama un candado atómico en audit_log antes de iniciar el lote."""
     moment = now_utc()
     query: dict[str, Any] = {"action": action, "raffle_id": str(raffle_id)}
     if cooldown_hours is not None:
         query["at"] = {"$gte": moment - timedelta(hours=cooldown_hours)}
+    elif cooldown_minutes is not None:
+        query["at"] = {"$gte": moment - timedelta(minutes=cooldown_minutes)}
 
     claim_id = uuid4().hex
     doc = db.audit_log.find_one_and_update(
@@ -103,9 +107,11 @@ def _claim_window_lock(
         return_document=ReturnDocument.AFTER,
     )
     if doc.get("claim_id") != claim_id:
-        if cooldown_hours is None:
-            raise ValueError("Esta campaña ya se envió para este sorteo")
-        raise ValueError(f"Ya se envió en las últimas {cooldown_hours} horas")
+        if cooldown_hours is not None:
+            raise ValueError(f"Ya se envió en las últimas {cooldown_hours} horas")
+        if cooldown_minutes is not None:
+            raise ValueError(f"Espera {cooldown_minutes} minutos antes de enviar la siguiente tanda")
+        raise ValueError("Esta campaña ya se envió para este sorteo")
     return doc["_id"]
 
 
@@ -347,8 +353,19 @@ def safe_auto_post_draw(db: Database, raffle_id: str, *, base_url: str = "") -> 
 
 
 # ---------- 4) Invitación a ex-participantes ----------
+def _already_invited_phones(db: Database, raffle_id: str) -> set[str]:
+    invited: set[str] = set()
+    for row in db.audit_log.find(
+        {"action": PAST_INVITE_ACTION, "raffle_id": str(raffle_id), "status": "sent"},
+        {"invited_phones": 1},
+    ):
+        for p in row.get("invited_phones") or []:
+            invited.add(str(p))
+    return invited
+
+
 def collect_past_participant_contacts(db: Database, raffle_id: str) -> dict[str, str]:
-    """Mapa {teléfono: primer_nombre} de sorteos anteriores que aún no participan aquí."""
+    """Mapa {teléfono: primer_nombre} de sorteos anteriores aún no participantes ni invitados."""
     rid = oid(raffle_id)
     current_phones: set[str] = set()
     for t in db.tickets.find({"raffle_id": rid}, {"participant.phone": 1}):
@@ -356,18 +373,21 @@ def collect_past_participant_contacts(db: Database, raffle_id: str) -> dict[str,
         if len(d) == 10:
             current_phones.add(d)
 
+    already_invited = _already_invited_phones(db, raffle_id)
+    excluded = current_phones | already_invited
+
     contacts: dict[str, str] = {}
     for t in db.tickets.find({"raffle_id": {"$ne": rid}}, {"participant.phone": 1, "participant.name": 1}):
         p = t.get("participant") or {}
         d = digits(p.get("phone"))
-        if len(d) == 10 and d not in current_phones and d not in contacts:
+        if len(d) == 10 and d not in excluded and d not in contacts:
             first_name = str(p.get("name") or "").strip().split(" ")[0]
             contacts[d] = first_name
     return contacts
 
 
 def collect_past_participant_phones(db: Database, raffle_id: str) -> list[str]:
-    """Teléfonos únicos de sorteos anteriores que aún no participan en el sorteo actual."""
+    """Teléfonos únicos de sorteos anteriores que aún no participan ni han sido invitados."""
     return sorted(collect_past_participant_contacts(db, raffle_id).keys())
 
 
@@ -377,6 +397,7 @@ def send_past_participants_invite(
     *,
     by: str,
     base_url: str = "",
+    batch_size: int = PAST_INVITE_BATCH_SIZE,
 ) -> dict:
     raffle = get_raffle(db, raffle_id)
     if not raffle:
@@ -387,16 +408,19 @@ def send_past_participants_invite(
     wr._require_config()
     eff_base = _effective_base_url(db, base_url)
     contacts = collect_past_participant_contacts(db, raffle_id)
-    phones = sorted(contacts.keys())
-    if not phones:
-        raise ValueError("No hay ex-participantes nuevos para invitar")
+    all_phones = sorted(contacts.keys())
+    if not all_phones:
+        raise ValueError("No hay ex-participantes pendientes por invitar")
+
+    batch = all_phones[: max(1, batch_size)]
+    remaining = max(0, len(all_phones) - len(batch))
 
     lock_id = _claim_window_lock(
         db,
         action=PAST_INVITE_ACTION,
         raffle_id=raffle_id,
         by=by,
-        cooldown_hours=PAST_INVITE_COOLDOWN_HOURS,
+        cooldown_minutes=PAST_INVITE_COOLDOWN_MINUTES,
     )
 
     title = raffle.get("title") or "Sorteo Natura"
@@ -417,22 +441,33 @@ def send_past_participants_invite(
         )
 
     sent, failed = _send_batch(
-        phones,
+        batch,
         _msg,
         delay_seconds=PAST_INVITE_DELAY_SECONDS,
         stop_on_disconnect=True,
     )
     if sent == 0:
         db.audit_log.delete_one({"_id": lock_id})
-        raise ValueError(f"No se pudo invitar a ex-participantes ({failed} fallos)")
+        raise ValueError(f"No se pudo invitar a ex-participantes ({failed} fallos); revisa que WhatsApp esté Connected")
 
+    # Solo marca como invitados los que sí alcanzaron a intentarse antes de un posible corte
+    attempted = batch[: sent + failed] if failed < len(batch) else batch
     db.audit_log.update_one(
         {"_id": lock_id},
-        {"$set": {"status": "sent", "sent": sent, "failed": failed, "recipients": len(phones)}},
+        {
+            "$set": {
+                "status": "sent",
+                "sent": sent,
+                "failed": failed,
+                "recipients": len(batch),
+                "invited_phones": attempted,
+            }
+        },
     )
     return {
         "sent": sent,
         "failed": failed,
         "skipped_no_phone": 0,
-        "recipients": len(phones),
+        "recipients": len(batch),
+        "remaining": remaining,
     }
