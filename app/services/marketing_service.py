@@ -19,6 +19,7 @@ POST_DRAW_ACTION = "post_draw_campaign"
 PAST_INVITE_ACTION = "past_invite"
 UNPAID_COOLDOWN_HOURS = 12
 PAST_INVITE_COOLDOWN_HOURS = 24
+PAST_INVITE_DELAY_SECONDS = 4.5
 
 
 def _effective_base_url(db: Database, base_url: str) -> str:
@@ -29,10 +30,18 @@ def _effective_base_url(db: Database, base_url: str) -> str:
     return cfg_base
 
 
-def _send_batch(phones: list[str], message_for: Any) -> tuple[int, int]:
-    """Envía mensajes uno a uno con DELAY_SECONDS respetando Evolution API."""
+def _send_batch(
+    phones: list[str],
+    message_for: Any,
+    *,
+    delay_seconds: float | None = None,
+    stop_on_disconnect: bool = False,
+) -> tuple[int, int]:
+    """Envía mensajes uno a uno respetando pausa anti-ban de WhatsApp."""
     url, api_key, instance = wr._require_config()
+    delay = wr.DELAY_SECONDS if delay_seconds is None else delay_seconds
     sent = failed = 0
+    consecutive_errors = 0
     for i, phone in enumerate(phones):
         try:
             text = message_for(phone) if callable(message_for) else str(message_for)
@@ -44,10 +53,22 @@ def _send_batch(phones: list[str], message_for: Any) -> tuple[int, int]:
                 text=text,
             )
             sent += 1
-        except Exception:
+            consecutive_errors = 0
+        except Exception as exc:
             failed += 1
-        if i < len(phones) - 1:
-            time.sleep(wr.DELAY_SECONDS)
+            consecutive_errors += 1
+            err_txt = str(exc).lower()
+            if stop_on_disconnect and (
+                "428" in err_txt
+                or "connection closed" in err_txt
+                or "404" in err_txt
+                or consecutive_errors >= 3
+            ):
+                # Cuenta los restantes como no enviados y corta para no quemar el número
+                failed += len(phones) - i - 1
+                break
+        if i < len(phones) - 1 and delay > 0:
+            time.sleep(delay)
     return sent, failed
 
 
@@ -326,8 +347,8 @@ def safe_auto_post_draw(db: Database, raffle_id: str, *, base_url: str = "") -> 
 
 
 # ---------- 4) Invitación a ex-participantes ----------
-def collect_past_participant_phones(db: Database, raffle_id: str) -> list[str]:
-    """Teléfonos únicos de sorteos anteriores que aún no participan en el sorteo actual."""
+def collect_past_participant_contacts(db: Database, raffle_id: str) -> dict[str, str]:
+    """Mapa {teléfono: primer_nombre} de sorteos anteriores que aún no participan aquí."""
     rid = oid(raffle_id)
     current_phones: set[str] = set()
     for t in db.tickets.find({"raffle_id": rid}, {"participant.phone": 1}):
@@ -335,12 +356,19 @@ def collect_past_participant_phones(db: Database, raffle_id: str) -> list[str]:
         if len(d) == 10:
             current_phones.add(d)
 
-    past_phones: set[str] = set()
-    for t in db.tickets.find({"raffle_id": {"$ne": rid}}, {"participant.phone": 1}):
-        d = digits((t.get("participant") or {}).get("phone"))
-        if len(d) == 10 and d not in current_phones:
-            past_phones.add(d)
-    return sorted(past_phones)
+    contacts: dict[str, str] = {}
+    for t in db.tickets.find({"raffle_id": {"$ne": rid}}, {"participant.phone": 1, "participant.name": 1}):
+        p = t.get("participant") or {}
+        d = digits(p.get("phone"))
+        if len(d) == 10 and d not in current_phones and d not in contacts:
+            first_name = str(p.get("name") or "").strip().split(" ")[0]
+            contacts[d] = first_name
+    return contacts
+
+
+def collect_past_participant_phones(db: Database, raffle_id: str) -> list[str]:
+    """Teléfonos únicos de sorteos anteriores que aún no participan en el sorteo actual."""
+    return sorted(collect_past_participant_contacts(db, raffle_id).keys())
 
 
 def send_past_participants_invite(
@@ -358,7 +386,8 @@ def send_past_participants_invite(
 
     wr._require_config()
     eff_base = _effective_base_url(db, base_url)
-    phones = collect_past_participant_phones(db, raffle_id)
+    contacts = collect_past_participant_contacts(db, raffle_id)
+    phones = sorted(contacts.keys())
     if not phones:
         raise ValueError("No hay ex-participantes nuevos para invitar")
 
@@ -377,14 +406,22 @@ def send_past_participants_invite(
     slug = raffle.get("slug") or ""
     landing = f"{eff_base}/sorteo/{slug}" if eff_base else ""
 
-    msg = (
-        f"¡Hola! 🌿 Ya abrió un nuevo raspadito Natura: *{title}* 🎟️\n"
-        f"🎁 Premio: {prize}\n"
-        f"💰 Tu boleto sale de ${pmin} a ${pmax} MXN al raspar (misma probabilidad para todos 🍀)\n"
-        + (f"Escoge tu folio antes de que vuelen 👉 {landing}" if landing else "Escríbeme si quieres apartar folio 🙌")
-    )
+    def _msg(phone: str) -> str:
+        name = contacts.get(phone, "")
+        saludo = f"¡Hola {name}! 🌿" if name else "¡Hola! 🌿"
+        return (
+            f"{saludo} Ya abrió un nuevo raspadito Natura: *{title}* 🎟️\n"
+            f"🎁 Premio: {prize}\n"
+            f"💰 Tu boleto sale de ${pmin} a ${pmax} MXN al raspar (misma probabilidad para todos 🍀)\n"
+            + (f"Escoge tu folio antes de que vuelen 👉 {landing}" if landing else "Escríbeme si quieres apartar folio 🙌")
+        )
 
-    sent, failed = _send_batch(phones, msg)
+    sent, failed = _send_batch(
+        phones,
+        _msg,
+        delay_seconds=PAST_INVITE_DELAY_SECONDS,
+        stop_on_disconnect=True,
+    )
     if sent == 0:
         db.audit_log.delete_one({"_id": lock_id})
         raise ValueError(f"No se pudo invitar a ex-participantes ({failed} fallos)")

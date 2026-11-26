@@ -138,6 +138,30 @@ def test_invite_past_participants_excludes_current_raffle(client, admin, db, raf
     assert inv.status_code == 200
     assert inv.json()["sent"] == 1
     assert sent_calls[0]["jid"] == "525544332211"
+    assert "¡Hola Caro!" in sent_calls[0]["text"]
+
+
+def test_send_batch_stops_early_on_428_disconnect(monkeypatch):
+    calls = []
+
+    def fake_send(**kw):
+        calls.append(kw)
+        if len(calls) == 2:
+            raise RuntimeError("Evolution HTTP 428 Connection Closed")
+
+    monkeypatch.setattr(wr, "get_settings", lambda: _evo_settings())
+    monkeypatch.setattr(wr, "send_text_evolution", fake_send)
+    monkeypatch.setattr(wr.time, "sleep", lambda s: None)
+
+    sent, failed = mks._send_batch(
+        ["5511111111", "5522222222", "5533333333", "5544444444"],
+        "Hola",
+        delay_seconds=0,
+        stop_on_disconnect=True,
+    )
+    assert sent == 1
+    assert failed == 3
+    assert len(calls) == 2
 
 
 def test_facebook_publish_and_milestone_auto_trigger(client, admin, db, monkeypatch):
