@@ -136,9 +136,13 @@ def test_invite_past_participants_excludes_current_raffle(client, admin, db, raf
         json={"base_url": "https://sorteo.test"},
     )
     assert inv.status_code == 200
-    assert inv.json()["sent"] == 1
+    assert inv.json()["recipients"] == 1
     assert sent_calls[0]["jid"] == "525544332211"
     assert "¡Hola Caro!" in sent_calls[0]["text"]
+    st2 = client.get(f"/api/v1/raffles/{rid2}/marketing/status", headers=admin)
+    assert st2.json()["past_invite_job"]["status"] == "completed"
+    assert st2.json()["past_invite_job"]["sent"] == 1
+    assert st2.json()["past_participants_count"] == 0
 
 
 def test_send_batch_stops_early_on_428_disconnect(monkeypatch):

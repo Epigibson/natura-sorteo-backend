@@ -366,6 +366,7 @@ def marketing_status(
         "fb_posts": sorted(set(fb_posts)),
         "fb_configured": bool(settings.get("fb_page_id") and settings.get("fb_token_configured")),
         "evolution_configured": bool(settings.get("evolution_configured")),
+        "past_invite_job": mks.get_latest_past_invite_job(db, raffle_id),
     }
 
 
@@ -392,17 +393,26 @@ def marketing_invite_past(
     raffle_id: str,
     body: MarketingActionIn,
     request: Request,
+    background_tasks: BackgroundTasks,
     user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> dict:
+    db = get_db()
+    base_url = body.base_url or _origin_from_request(request)
     try:
-        return mks.send_past_participants_invite(
-            get_db(),
-            raffle_id,
-            by=user["sub"],
-            base_url=body.base_url or _origin_from_request(request),
+        job_id, summary = mks.start_past_participants_job(
+            db, raffle_id, by=user["sub"], base_url=base_url
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    background_tasks.add_task(
+        mks.run_past_participants_job,
+        db,
+        job_id,
+        raffle_id,
+        by=user["sub"],
+        base_url=base_url,
+    )
+    return summary
 
 
 @router.post("/raffles/{raffle_id}/marketing/post-draw", response_model=RemindOut)

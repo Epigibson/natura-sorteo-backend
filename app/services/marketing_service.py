@@ -17,10 +17,12 @@ from app.services.raffle_service import audit, digits, get_raffle, now_utc, oid
 UNPAID_REMIND_ACTION = "unpaid_remind"
 POST_DRAW_ACTION = "post_draw_campaign"
 PAST_INVITE_ACTION = "past_invite"
+PAST_INVITE_JOB_ACTION = "past_invite_job"
 UNPAID_COOLDOWN_HOURS = 12
 PAST_INVITE_COOLDOWN_MINUTES = 2
 PAST_INVITE_BATCH_SIZE = 12
 PAST_INVITE_DELAY_SECONDS = 4.0
+PAST_INVITE_BATCH_PAUSE_SECONDS = 180
 
 
 def _effective_base_url(db: Database, base_url: str) -> str:
@@ -394,6 +396,177 @@ def collect_past_participant_contacts(db: Database, raffle_id: str) -> dict[str,
 def collect_past_participant_phones(db: Database, raffle_id: str) -> list[str]:
     """Teléfonos únicos de sorteos anteriores que aún no participan ni han sido invitados."""
     return sorted(collect_past_participant_contacts(db, raffle_id).keys())
+
+
+def get_latest_past_invite_job(db: Database, raffle_id: str) -> dict | None:
+    """Devuelve el último trabajo automático de invitación para mostrar progreso en el panel."""
+    row = db.audit_log.find_one(
+        {"action": PAST_INVITE_JOB_ACTION, "raffle_id": str(raffle_id)},
+        sort=[("at", -1)],
+    )
+    if not row:
+        return None
+    return {
+        "status": row.get("status", "unknown"),
+        "total": int(row.get("total") or 0),
+        "sent": int(row.get("sent") or 0),
+        "failed": int(row.get("failed") or 0),
+        "remaining": int(row.get("remaining") or 0),
+    }
+
+
+def start_past_participants_job(
+    db: Database,
+    raffle_id: str,
+    *,
+    by: str,
+    base_url: str = "",
+) -> tuple[Any, dict]:
+    """Crea un trabajo en segundo plano para invitar a todos los ex-participantes en tandas seguras."""
+    raffle = get_raffle(db, raffle_id)
+    if not raffle:
+        raise ValueError("Sorteo no encontrado")
+    if raffle.get("status") not in ("open", "closed"):
+        raise ValueError("Solo se pueden invitar ex-participantes a sorteos abiertos o cerrados")
+
+    wr._require_config()
+    contacts = collect_past_participant_contacts(db, raffle_id)
+    all_phones = sorted(contacts.keys())
+    if not all_phones:
+        raise ValueError("No hay ex-participantes pendientes por invitar")
+
+    # Evitar dos campañas automáticas simultáneas en el mismo sorteo (ventana de 2h por si un proceso murió)
+    cutoff = now_utc() - timedelta(hours=2)
+    running = db.audit_log.find_one(
+        {
+            "action": PAST_INVITE_JOB_ACTION,
+            "raffle_id": str(raffle_id),
+            "status": "running",
+            "at": {"$gte": cutoff},
+        }
+    )
+    if running:
+        raise ValueError("Ya hay un envío automático en curso para este sorteo")
+
+    res = db.audit_log.insert_one(
+        {
+            "at": now_utc(),
+            "action": PAST_INVITE_JOB_ACTION,
+            "by": by,
+            "raffle_id": str(raffle_id),
+            "status": "running",
+            "total": len(all_phones),
+            "sent": 0,
+            "failed": 0,
+            "remaining": len(all_phones),
+        }
+    )
+    summary = {
+        "sent": 0,
+        "failed": 0,
+        "skipped_no_phone": 0,
+        "recipients": len(all_phones),
+        "remaining": len(all_phones),
+    }
+    return res.inserted_id, summary
+
+
+def run_past_participants_job(
+    db: Database,
+    job_id: Any,
+    raffle_id: str,
+    *,
+    by: str,
+    base_url: str = "",
+    batch_size: int = PAST_INVITE_BATCH_SIZE,
+) -> None:
+    """Ejecuta en segundo plano todas las tandas de 12 con pausa de 3 min entre tandas."""
+    try:
+        raffle = get_raffle(db, raffle_id)
+        if not raffle:
+            db.audit_log.update_one({"_id": job_id}, {"$set": {"status": "error"}})
+            return
+
+        eff_base = _effective_base_url(db, base_url)
+        contacts = collect_past_participant_contacts(db, raffle_id)
+        all_phones = sorted(contacts.keys())
+        if not all_phones:
+            db.audit_log.update_one({"_id": job_id}, {"$set": {"status": "completed", "remaining": 0}})
+            return
+
+        title = raffle.get("title") or "Sorteo Natura"
+        prize = raffle.get("prize") or "Premio Natura"
+        pmin = raffle.get("price_min") or 30
+        pmax = raffle.get("price_max") or 50
+        slug = raffle.get("slug") or ""
+        landing = f"{eff_base}/sorteo/{slug}" if eff_base else ""
+
+        def _msg(phone: str) -> str:
+            name = contacts.get(phone, "")
+            saludo = f"¡Hola {name}! 🌿" if name else "¡Hola! 🌿"
+            return (
+                f"{saludo} Ya abrió un nuevo raspadito Natura: *{title}* 🎟️\n"
+                f"🎁 Premio: {prize}\n"
+                f"💰 Tu boleto sale de ${pmin} a ${pmax} MXN al raspar (misma probabilidad para todos 🍀)\n"
+                + (f"Escoge tu folio antes de que vuelen 👉 {landing}" if landing else "Escríbeme si quieres apartar folio 🙌")
+            )
+
+        total_sent = 0
+        total_failed = 0
+        size = max(1, batch_size)
+        chunks = [all_phones[i : i + size] for i in range(0, len(all_phones), size)]
+
+        for idx, batch in enumerate(chunks):
+            sent, failed = _send_batch(
+                batch,
+                _msg,
+                delay_seconds=PAST_INVITE_DELAY_SECONDS,
+                stop_on_disconnect=True,
+            )
+            total_sent += sent
+            total_failed += failed
+            remaining = sum(len(c) for c in chunks[idx + 1 :])
+
+            if sent > 0:
+                db.audit_log.insert_one(
+                    {
+                        "at": now_utc(),
+                        "action": PAST_INVITE_ACTION,
+                        "by": by,
+                        "raffle_id": str(raffle_id),
+                        "status": "sent",
+                        "sent": sent,
+                        "failed": failed,
+                        "recipients": len(batch),
+                        "invited_phones": batch,
+                    }
+                )
+
+            db.audit_log.update_one(
+                {"_id": job_id},
+                {"$set": {"sent": total_sent, "failed": total_failed, "remaining": remaining}},
+            )
+
+            # Si una tanda entera falló (sent == 0), asumimos caída de sesión y detenemos el job
+            if sent == 0:
+                db.audit_log.update_one(
+                    {"_id": job_id},
+                    {"$set": {"status": "stopped_disconnect"}},
+                )
+                return
+
+            if idx < len(chunks) - 1 and PAST_INVITE_BATCH_PAUSE_SECONDS > 0:
+                time.sleep(PAST_INVITE_BATCH_PAUSE_SECONDS)
+
+        db.audit_log.update_one(
+            {"_id": job_id},
+            {"$set": {"status": "completed", "remaining": 0}},
+        )
+    except Exception as exc:
+        db.audit_log.update_one(
+            {"_id": job_id},
+            {"$set": {"status": "error", "error": str(exc)[:200]}},
+        )
 
 
 def send_past_participants_invite(
