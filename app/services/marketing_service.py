@@ -1,9 +1,10 @@
 """Automatizaciones de marketing por WhatsApp (Evolution API)."""
 from __future__ import annotations
 
+import random
 import time
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pymongo import ReturnDocument
@@ -18,11 +19,17 @@ UNPAID_REMIND_ACTION = "unpaid_remind"
 POST_DRAW_ACTION = "post_draw_campaign"
 PAST_INVITE_ACTION = "past_invite"
 PAST_INVITE_JOB_ACTION = "past_invite_job"
+WA_VIP_GROUP_ACTION = "wa_vip_group"
 UNPAID_COOLDOWN_HOURS = 12
-PAST_INVITE_COOLDOWN_MINUTES = 2
-PAST_INVITE_BATCH_SIZE = 12
-PAST_INVITE_DELAY_SECONDS = 4.0
-PAST_INVITE_BATCH_PAUSE_SECONDS = 180
+PAST_INVITE_COOLDOWN_MINUTES = 15
+PAST_INVITE_BATCH_SIZE = 5
+PAST_INVITE_DELAY_SECONDS = 35.0
+PAST_INVITE_DELAY_MIN = 25.0
+PAST_INVITE_DELAY_MAX = 55.0
+PAST_INVITE_BATCH_PAUSE_SECONDS = 900
+DAILY_COLD_LIMIT = 15
+
+VipGroupKind = Literal["launch", "scarcity", "winner"]
 
 
 def _effective_base_url(db: Database, base_url: str) -> str:
@@ -76,7 +83,8 @@ def _send_batch(
                     failed += len(phones) - i - 1
                     break
         if i < len(phones) - 1 and delay > 0:
-            time.sleep(delay)
+            jittered = random.uniform(max(5.0, delay * 0.7), delay * 1.45)
+            wr.time.sleep(jittered)
     return sent, failed
 
 
@@ -123,7 +131,13 @@ def _claim_window_lock(
 
 
 # ---------- 1) Auto-confirmación de pago + Referido 1+1 ----------
-def build_payment_confirmed_message(raffle: dict, ticket: dict, base_url: str) -> str:
+def build_payment_confirmed_message(
+    raffle: dict,
+    ticket: dict,
+    base_url: str,
+    *,
+    vip_invite_url: str = "",
+) -> str:
     p = ticket.get("participant") or {}
     name = str(p.get("name") or "").split(" ")[0] or "hola"
     folio = int(ticket.get("folio") or 0)
@@ -140,6 +154,9 @@ def build_payment_confirmed_message(raffle: dict, ticket: dict, base_url: str) -
         + (f" aquí 👉 {landing}" if landing else "")
         + ", te regalo un *10% de descuento* en tu próximo pedido Natura. ¡Mucha suerte! 🍀"
     )
+    clean_vip = (vip_invite_url or "").strip()
+    if clean_vip:
+        msg += f"\n\n📲 Únete a nuestro *Grupo VIP* para enterarte primero de las próximas rifas: {clean_vip}"
     return msg
 
 
@@ -155,7 +172,8 @@ def safe_notify_payment_confirmed(
         s = get_settings()
         if not s.evolution_url:
             return
-        if not aps.get_marketing_settings(db).get("auto_wa_on_pay", True):
+        mkt_cfg = aps.get_marketing_settings(db)
+        if not mkt_cfg.get("auto_wa_on_pay", True):
             return
         phone = digits((ticket.get("participant") or {}).get("phone"))
         if len(phone) != 10:
@@ -164,7 +182,12 @@ def safe_notify_payment_confirmed(
         if not raffle:
             return
         eff_base = _effective_base_url(db, base_url)
-        text = build_payment_confirmed_message(raffle, ticket, eff_base)
+        text = build_payment_confirmed_message(
+            raffle,
+            ticket,
+            eff_base,
+            vip_invite_url=str(mkt_cfg.get("wa_vip_group_invite_url") or ""),
+        )
         wr.send_text_evolution(
             url=s.evolution_url,
             api_key=s.evolution_api_key,
@@ -415,6 +438,143 @@ def get_latest_past_invite_job(db: Database, raffle_id: str) -> dict | None:
     }
 
 
+def _daily_cold_sent_count(db: Database) -> int:
+    cutoff = now_utc() - timedelta(hours=24)
+    total = 0
+    for row in db.audit_log.find(
+        {"action": PAST_INVITE_ACTION, "status": "sent", "at": {"$gte": cutoff}},
+        {"sent": 1},
+    ):
+        total += int(row.get("sent") or 0)
+    return total
+
+
+def _build_past_invite_text(
+    *,
+    index: int,
+    name: str,
+    title: str,
+    prize: str,
+    pmin: int,
+    pmax: int,
+    landing: str,
+) -> str:
+    """Rota 3 variaciones naturales para evitar mensajes idénticos en cadena."""
+    saludo = f"¡Hola {name}!" if name else "¡Hola!"
+    cta = f"Aquí puedes ver los folios libres 👉 {landing}" if landing else "Dime si te mando el tablero 🙌"
+    variant = index % 3
+    if variant == 0:
+        return (
+            f"{saludo} 🌿 Te aviso rápido que ya abrimos nuevo raspadito Natura: *{title}* 🎟️\n"
+            f"🎁 Premio: {prize}\n"
+            f"💰 Boletos entre ${pmin} y ${pmax} MXN al raspar (misma probabilidad para todos 🍀)\n"
+            f"{cta}"
+        )
+    if variant == 1:
+        return (
+            f"{saludo} ✨ Ya está activo el nuevo raspadito *{title}* ({prize}).\n"
+            f"Tu precio sale de ${pmin} a ${pmax} pesitos al raspar tu folio 🎰\n"
+            f"{cta}"
+        )
+    return (
+        f"{saludo} 🍀 Como ya participaste antes, te paso primero el nuevo sorteo *{title}*.\n"
+        f"Premio: *{prize}* · Boletos desde ${pmin} hasta ${pmax} MXN.\n"
+        f"{cta}"
+    )
+
+
+def send_vip_group_announcement(
+    db: Database,
+    raffle_id: str,
+    *,
+    kind: VipGroupKind = "launch",
+    by: str,
+    base_url: str = "",
+    image_base64: str | None = None,
+) -> dict:
+    """Envía 1 solo anuncio (con imagen promo opcional) al Grupo VIP de WhatsApp. 0% riesgo de ban."""
+    raffle = get_raffle(db, raffle_id)
+    if not raffle:
+        raise ValueError("Sorteo no encontrado")
+
+    url, api_key, instance = wr._require_config()
+    mkt = aps.get_marketing_settings(db)
+    group_jid = str(mkt.get("wa_vip_group_jid") or "").strip()
+    if not group_jid:
+        raise ValueError("Falta configurar el Grupo VIP de WhatsApp en Configuración")
+
+    rid = oid(raffle_id)
+    paid_count = db.tickets.count_documents({"raffle_id": rid, "status": "paid"})
+    total = int(raffle.get("ticket_count") or 21)
+    free_count = max(0, total - paid_count)
+    title = raffle.get("title") or "Sorteo Natura"
+    prize = raffle.get("prize") or "Premio Natura"
+    prize_value = raffle.get("prize_value") or 0
+    pmin = raffle.get("price_min") or 30
+    pmax = raffle.get("price_max") or 50
+    draw_date = raffle.get("draw_date") or "en vivo próximamente"
+    slug = raffle.get("slug") or ""
+    eff_base = _effective_base_url(db, base_url)
+    landing = f"{eff_base}/sorteo/{slug}" if eff_base else ""
+
+    if kind == "launch":
+        caption = (
+            f"🎁 *¡NUEVO RASPADITO NATURA!* ✨\n\n"
+            f"*{title}* — Premio: *{prize}* (valor catálogo ${prize_value} MXN 🔥)\n"
+            f"🔹 Solo {total} boletos disponibles\n"
+            f"🔹 Tu precio sale entre ${pmin} y ${pmax} MXN al raspar\n"
+            f"🔹 Pagues ${pmin} o ${pmax}, todos tienen la misma probabilidad 🍀\n"
+            f"🔹 Sorteo en vivo: {draw_date}\n\n"
+            + (f"👇 Escoge tu folio y raspa aquí:\n{landing}" if landing else "👇 Escríbeme para apartar tu folio")
+        )
+    elif kind == "scarcity":
+        caption = (
+            f"⏳ *¡QUEDAN SOLO {free_count} DE {total} BOLETOS!* 🔥\n\n"
+            f"En *{title}* ({prize}, valor ${prize_value} MXN) ya se pagaron {paid_count} lugares.\n"
+            f"Todavía hay boletos desde ${pmin} MXN 🍀\n\n"
+            + (f"👇 Aparta y raspa el tuyo antes de que se acaben:\n{landing}" if landing else "👇 Escríbeme antes de que cierren")
+        )
+    else:  # winner
+        winner = raffle.get("winner") or {}
+        w_folio = winner.get("folio") or "—"
+        w_name = (winner.get("participant") or {}).get("name") or "Participante"
+        folio_txt = f"#{w_folio:02d}" if isinstance(w_folio, int) else f"#{w_folio}"
+        caption = (
+            f"🏆 *¡TENEMOS GANADOR en {title}!* 🎉\n\n"
+            f"El premio (*{prize}*) se fue con el folio *{folio_txt}* — {w_name} 🍀✨\n"
+            f"¡Muchas gracias a todas por participar! Muy pronto abrimos el siguiente raspadito Natura 💚"
+        )
+
+    if image_base64 and image_base64.strip():
+        wr.send_media_evolution(
+            url=url,
+            api_key=api_key,
+            instance=instance,
+            jid=group_jid,
+            media_base64=image_base64,
+            caption=caption,
+        )
+    else:
+        wr.send_text_evolution(
+            url=url,
+            api_key=api_key,
+            instance=instance,
+            jid=group_jid,
+            text=caption,
+        )
+
+    audit(
+        db,
+        WA_VIP_GROUP_ACTION,
+        by=by,
+        raffle_id=str(raffle_id),
+        kind=kind,
+        group_jid=group_jid,
+        status="ok",
+    )
+    return {"ok": True, "kind": kind, "group_jid": group_jid, "message": caption}
+
+
 def start_past_participants_job(
     db: Database,
     raffle_id: str,
@@ -422,7 +582,7 @@ def start_past_participants_job(
     by: str,
     base_url: str = "",
 ) -> tuple[Any, dict]:
-    """Crea un trabajo en segundo plano para invitar a todos los ex-participantes en tandas seguras."""
+    """Crea un trabajo en segundo plano con tope diario anti-ban (máx 15/día)."""
     raffle = get_raffle(db, raffle_id)
     if not raffle:
         raise ValueError("Sorteo no encontrado")
@@ -430,8 +590,16 @@ def start_past_participants_job(
         raise ValueError("Solo se pueden invitar ex-participantes a sorteos abiertos o cerrados")
 
     wr._require_config()
+    already_today = _daily_cold_sent_count(db)
+    budget = max(0, DAILY_COLD_LIMIT - already_today)
+    if budget <= 0:
+        raise ValueError(
+            f"Límite anti-ban alcanzado ({DAILY_COLD_LIMIT} envíos 1-a-1 en las últimas 24 h). "
+            "Usa el Grupo VIP o intenta mañana."
+        )
+
     contacts = collect_past_participant_contacts(db, raffle_id)
-    all_phones = sorted(contacts.keys())
+    all_phones = sorted(contacts.keys())[:budget]
     if not all_phones:
         raise ValueError("No hay ex-participantes pendientes por invitar")
 
@@ -480,7 +648,7 @@ def run_past_participants_job(
     base_url: str = "",
     batch_size: int = PAST_INVITE_BATCH_SIZE,
 ) -> None:
-    """Ejecuta en segundo plano todas las tandas de 12 con pausa de 3 min entre tandas."""
+    """Ejecuta en segundo plano tandas seguras de 5 con pausas largas anti-ban y tope diario de 15."""
     try:
         raffle = get_raffle(db, raffle_id)
         if not raffle:
@@ -488,8 +656,9 @@ def run_past_participants_job(
             return
 
         eff_base = _effective_base_url(db, base_url)
+        budget = max(0, DAILY_COLD_LIMIT - _daily_cold_sent_count(db))
         contacts = collect_past_participant_contacts(db, raffle_id)
-        all_phones = sorted(contacts.keys())
+        all_phones = sorted(contacts.keys())[:budget]
         if not all_phones:
             db.audit_log.update_one({"_id": job_id}, {"$set": {"status": "completed", "remaining": 0}})
             return
@@ -500,15 +669,17 @@ def run_past_participants_job(
         pmax = raffle.get("price_max") or 50
         slug = raffle.get("slug") or ""
         landing = f"{eff_base}/sorteo/{slug}" if eff_base else ""
+        phone_index = {p: i for i, p in enumerate(all_phones)}
 
         def _msg(phone: str) -> str:
-            name = contacts.get(phone, "")
-            saludo = f"¡Hola {name}! 🌿" if name else "¡Hola! 🌿"
-            return (
-                f"{saludo} Ya abrió un nuevo raspadito Natura: *{title}* 🎟️\n"
-                f"🎁 Premio: {prize}\n"
-                f"💰 Tu boleto sale de ${pmin} a ${pmax} MXN al raspar (misma probabilidad para todos 🍀)\n"
-                + (f"Escoge tu folio antes de que vuelen 👉 {landing}" if landing else "Escríbeme si quieres apartar folio 🙌")
+            return _build_past_invite_text(
+                index=phone_index.get(phone, 0),
+                name=contacts.get(phone, ""),
+                title=title,
+                prize=prize,
+                pmin=pmin,
+                pmax=pmax,
+                landing=landing,
             )
 
         total_sent = 0
@@ -556,7 +727,7 @@ def run_past_participants_job(
                 return
 
             if idx < len(chunks) - 1 and PAST_INVITE_BATCH_PAUSE_SECONDS > 0:
-                time.sleep(PAST_INVITE_BATCH_PAUSE_SECONDS)
+                wr.time.sleep(PAST_INVITE_BATCH_PAUSE_SECONDS)
 
         db.audit_log.update_one(
             {"_id": job_id},

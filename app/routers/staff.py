@@ -15,6 +15,7 @@ from app.schemas import (
     AppSettingsOut,
     ChangePasswordIn,
     FacebookPublishIn,
+    WhatsAppGroupPublishIn,
     MarketingActionIn,
     MarketingSettingsIn,
     MarketingSettingsOut,
@@ -335,6 +336,19 @@ def mass_remind(
 
 
 # ---------- Marketing y Automatización ----------
+@router.get("/marketing/whatsapp-groups")
+def list_whatsapp_groups(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> list[dict]:
+    from app.services import whatsapp_reminder as wrm
+
+    try:
+        url, api_key, instance = wrm._require_config()
+        return wrm.fetch_groups_evolution(url=url, api_key=api_key, instance=instance)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
 @router.get("/raffles/{raffle_id}/marketing/status")
 def marketing_status(
     raffle_id: str,
@@ -360,12 +374,22 @@ def marketing_status(
         )
         if row.get("kind")
     ]
+    wa_vip_posts = [
+        row.get("kind")
+        for row in db.audit_log.find(
+            {"action": mks.WA_VIP_GROUP_ACTION, "raffle_id": str(raffle_id), "status": "ok"},
+            {"kind": 1},
+        )
+        if row.get("kind")
+    ]
     return {
         "past_participants_count": len(mks.collect_past_participant_phones(db, raffle_id)),
         "unpaid_with_phone_count": len(unpaid_phones),
         "fb_posts": sorted(set(fb_posts)),
+        "wa_vip_posts": sorted(set(wa_vip_posts)),
         "fb_configured": bool(settings.get("fb_page_id") and settings.get("fb_token_configured")),
         "evolution_configured": bool(settings.get("evolution_configured")),
+        "wa_vip_group_configured": bool(settings.get("wa_vip_group_jid")),
         "past_invite_job": mks.get_latest_past_invite_job(db, raffle_id),
     }
 
@@ -450,6 +474,26 @@ def marketing_publish_facebook(
             base_url=body.base_url or _origin_from_request(request),
             by=user["sub"],
             force=body.force,
+            image_base64=body.image_base64,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/marketing/whatsapp-group")
+def marketing_publish_whatsapp_group(
+    raffle_id: str,
+    body: WhatsAppGroupPublishIn,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return mks.send_vip_group_announcement(
+            get_db(),
+            raffle_id,
+            kind=body.kind,
+            by=user["sub"],
+            base_url=body.base_url or _origin_from_request(request),
             image_base64=body.image_base64,
         )
     except (ValueError, RuntimeError) as exc:

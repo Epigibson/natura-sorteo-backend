@@ -15,7 +15,8 @@ from app.services.raffle_service import digits, get_raffle, now_utc, oid
 
 MASS_REMIND_ACTION = "mass_remind"
 COOLDOWN_HOURS = 24
-DELAY_SECONDS = 1.5
+DELAY_SECONDS = 30.0
+TYPING_DELAY_MS = 2500
 
 _ALLOWED_STATUSES = frozenset({"open", "closed", "drawing"})
 
@@ -66,7 +67,7 @@ def send_text_evolution(*, url: str, api_key: str, instance: str, jid: str, text
         r = httpx.post(
             endpoint,
             headers={"apikey": api_key},
-            json={"number": target_jid, "text": text},
+            json={"number": target_jid, "text": text, "delay": TYPING_DELAY_MS},
             timeout=30,
         )
         r.raise_for_status()
@@ -83,6 +84,73 @@ def send_text_evolution(*, url: str, api_key: str, instance: str, jid: str, text
                 raise RuntimeError(f"Evolution HTTP {exc2.response.status_code}") from exc2
             except httpx.HTTPError as exc2:
                 raise RuntimeError(f"Evolution error: {exc2}") from exc2
+        raise RuntimeError(f"Evolution HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Evolution error: {exc}") from exc
+
+
+def send_media_evolution(
+    *,
+    url: str,
+    api_key: str,
+    instance: str,
+    jid: str,
+    media_base64: str,
+    caption: str,
+) -> None:
+    """Envía una imagen PNG en base64 con caption vía Evolution API (ideal para Grupo VIP)."""
+    endpoint = f"{url.rstrip('/')}/message/sendMedia/{instance}"
+    raw_b64 = media_base64.strip()
+    if "," in raw_b64 and raw_b64.startswith("data:"):
+        raw_b64 = raw_b64.split(",", 1)[1]
+    try:
+        r = httpx.post(
+            endpoint,
+            headers={"apikey": api_key},
+            json={
+                "number": jid,
+                "mediatype": "image",
+                "mimetype": "image/png",
+                "caption": caption,
+                "media": raw_b64,
+                "fileName": "promo.png",
+                "delay": TYPING_DELAY_MS,
+            },
+            timeout=45,
+        )
+        r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Evolution HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Evolution error: {exc}") from exc
+
+
+def fetch_groups_evolution(*, url: str, api_key: str, instance: str) -> list[dict[str, Any]]:
+    """Lista los grupos de WhatsApp de la instancia conectada en Evolution API."""
+    endpoint = f"{url.rstrip('/')}/group/fetchAllGroups/{instance}"
+    try:
+        r = httpx.get(
+            endpoint,
+            headers={"apikey": api_key},
+            params={"getParticipants": "false"},
+            timeout=25,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        groups = []
+        for g in data:
+            gid = str(g.get("id") or "").strip()
+            if not gid:
+                continue
+            groups.append({
+                "id": gid,
+                "subject": str(g.get("subject") or "Grupo sin nombre"),
+                "size": int(g.get("size") or 0),
+            })
+        return sorted(groups, key=lambda x: x["subject"].lower())
+    except httpx.HTTPStatusError as exc:
         raise RuntimeError(f"Evolution HTTP {exc.response.status_code}") from exc
     except httpx.HTTPError as exc:
         raise RuntimeError(f"Evolution error: {exc}") from exc

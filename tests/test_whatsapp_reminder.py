@@ -204,13 +204,13 @@ def test_send_text_evolution_ok(monkeypatch):
     )
     assert captured["url"] == "http://evo/message/sendText/sorteo"
     assert captured["headers"] == {"apikey": "k"}
-    assert captured["json"] == {"number": "525511223344", "text": "hola"}
+    assert captured["json"] == {"number": "525511223344", "text": "hola", "delay": wr.TYPING_DELAY_MS}
 
 
 def test_constants():
     assert wr.MASS_REMIND_ACTION == "mass_remind"
     assert wr.COOLDOWN_HOURS == 24
-    assert wr.DELAY_SECONDS == 1.5
+    assert wr.DELAY_SECONDS == 30.0
 
 
 def test_mass_remind_endpoint_admin_ok(client, admin, db, raffle, monkeypatch):

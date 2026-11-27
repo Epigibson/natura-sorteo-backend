@@ -96,13 +96,18 @@ def build_fb_message(
     return msg, landing_url
 
 
-def build_fb_first_comment(kind: PostKind, landing_url: str) -> str:
+def build_fb_first_comment(kind: PostKind, landing_url: str, *, vip_invite_url: str = "") -> str:
     """Construye el texto del primer comentario automático con el enlace al tablero."""
     if not landing_url or kind == "winner":
         return ""
     if kind == "milestone_80":
-        return f"🚨 ¡Últimos lugares! Escoge tu folio y raspa tu boleto aquí 👉 {landing_url}"
-    return f"👉 Participa aquí, escoge tu folio y raspa tu boleto: {landing_url}"
+        comment = f"🚨 ¡Últimos lugares! Escoge tu folio y raspa tu boleto aquí 👉 {landing_url}"
+    else:
+        comment = f"👉 Participa aquí, escoge tu folio y raspa tu boleto: {landing_url}"
+    clean_vip = (vip_invite_url or "").strip()
+    if clean_vip:
+        comment += f"\n\n📲 Únete a nuestro Grupo VIP de WhatsApp para enterarte primero: {clean_vip}"
+    return comment
 
 
 def post_to_facebook_graph(
@@ -210,8 +215,13 @@ def publish_raffle_post(
     rid = oid(raffle_id)
     paid_count = db.tickets.count_documents({"raffle_id": rid, "status": "paid"})
     effective_base = (base_url or "").strip().rstrip("/") or cfg_base
+    mkt_cfg = aps.get_marketing_settings(db)
     message, link = build_fb_message(raffle, kind, effective_base, paid_count=paid_count)
-    first_comment = build_fb_first_comment(kind, link)
+    first_comment = build_fb_first_comment(
+        kind,
+        link,
+        vip_invite_url=str(mkt_cfg.get("wa_vip_group_invite_url") or ""),
+    )
     image_bytes = _decode_image_base64(image_base64)
     image_url = str(raffle.get("image_url") or "").strip()
 

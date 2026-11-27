@@ -253,3 +253,47 @@ def test_facebook_publish_and_milestone_auto_trigger(client, admin, db, monkeypa
 
     assert any("ÚLTIMOS" in c["message"] for c in fb_calls)
     assert len(comment_calls) == 3
+
+
+def test_whatsapp_vip_group_announcement_and_invite_url(client, admin, db, raffle, monkeypatch):
+    rid = raffle["id"]
+    client.put(
+        "/api/v1/marketing/settings",
+        headers=admin,
+        json={
+            "auto_wa_on_pay": True,
+            "auto_wa_on_draw": False,
+            "auto_fb_on_create": False,
+            "auto_fb_milestones": False,
+            "public_base_url": "https://sorteo.test",
+            "fb_page_id": "",
+            "wa_vip_group_jid": "120363012345678901@g.us",
+            "wa_vip_group_invite_url": "https://chat.whatsapp.com/ABC123VIP",
+        },
+    )
+
+    media_calls = []
+    text_calls = []
+    monkeypatch.setattr(wr, "get_settings", lambda: _evo_settings())
+    monkeypatch.setattr(mks, "get_settings", lambda: _evo_settings())
+    monkeypatch.setattr(wr, "send_media_evolution", lambda **kw: media_calls.append(kw))
+    monkeypatch.setattr(wr, "send_text_evolution", lambda **kw: text_calls.append(kw))
+
+    # 1) Anuncio al Grupo VIP con imagen promo
+    sample_png_b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    res = client.post(
+        f"/api/v1/raffles/{rid}/marketing/whatsapp-group",
+        headers=admin,
+        json={"kind": "launch", "base_url": "https://sorteo.test", "image_base64": sample_png_b64},
+    )
+    assert res.status_code == 200
+    assert len(media_calls) == 1
+    assert media_calls[0]["jid"] == "120363012345678901@g.us"
+    assert f"https://sorteo.test/sorteo/{raffle['slug']}" in media_calls[0]["caption"]
+
+    # 2) Confirmación de pago incluye link de invitación voluntaria al Grupo VIP
+    client.post(f"/api/v1/raffles/{rid}/tickets/1/assign", headers=admin, json={"name": "Ana Lopez", "phone": "5511223344"})
+    pay = client.post(f"/api/v1/raffles/{rid}/tickets/1/pay", headers=admin, json={})
+    assert pay.status_code == 200
+    assert len(text_calls) == 1
+    assert "https://chat.whatsapp.com/ABC123VIP" in text_calls[0]["text"]
