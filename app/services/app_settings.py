@@ -48,6 +48,8 @@ def get_marketing_settings(db: Database) -> dict[str, Any]:
         "public_base_url": (s.public_base_url or "").strip().rstrip("/"),
         "fb_page_id": (s.fb_page_id or "").strip(),
         "fb_token_configured": bool((s.fb_page_access_token or "").strip()),
+        "ig_user_id": "",
+        "tiktok_configured": False,
         "evolution_configured": bool((s.evolution_url or "").strip()),
         "wa_vip_group_jid": "",
         "wa_vip_group_invite_url": "",
@@ -59,12 +61,15 @@ def get_marketing_settings(db: Database) -> dict[str, Any]:
         out["public_base_url"] = str(doc["public_base_url"] or "").strip().rstrip("/")
     if "fb_page_id" in doc and str(doc["fb_page_id"] or "").strip():
         out["fb_page_id"] = str(doc["fb_page_id"]).strip()
+    if "ig_user_id" in doc:
+        out["ig_user_id"] = str(doc["ig_user_id"] or "").strip()
     if "wa_vip_group_jid" in doc:
         out["wa_vip_group_jid"] = str(doc["wa_vip_group_jid"] or "").strip()
     if "wa_vip_group_invite_url" in doc:
         out["wa_vip_group_invite_url"] = str(doc["wa_vip_group_invite_url"] or "").strip()
     has_db_token = bool(str(doc.get("fb_page_access_token") or "").strip())
     out["fb_token_configured"] = has_db_token or bool(str(s.fb_page_access_token or "").strip())
+    out["tiktok_configured"] = bool(str(doc.get("tiktok_access_token") or "").strip())
     return out
 
 
@@ -76,6 +81,7 @@ def save_marketing_settings(db: Database, data: dict[str, Any]) -> dict[str, Any
         "auto_fb_milestones": bool(data.get("auto_fb_milestones", True)),
         "public_base_url": str(data.get("public_base_url") or "").strip().rstrip("/"),
         "fb_page_id": str(data.get("fb_page_id") or "").strip(),
+        "ig_user_id": str(data.get("ig_user_id") or "").strip(),
         "wa_vip_group_jid": str(data.get("wa_vip_group_jid") or "").strip(),
         "wa_vip_group_invite_url": str(data.get("wa_vip_group_invite_url") or "").strip(),
     }
@@ -86,6 +92,13 @@ def save_marketing_settings(db: Database, data: dict[str, Any]) -> dict[str, Any
             clean["fb_page_access_token"] = token_str
         else:
             db.app_settings.update_one({"_id": _MKT_KEY}, {"$unset": {"fb_page_access_token": ""}})
+    raw_tt = data.get("tiktok_access_token")
+    if raw_tt is not None:
+        tt_str = str(raw_tt).strip()
+        if tt_str:
+            clean["tiktok_access_token"] = tt_str
+        else:
+            db.app_settings.update_one({"_id": _MKT_KEY}, {"$unset": {"tiktok_access_token": ""}})
     db.app_settings.update_one({"_id": _MKT_KEY}, {"$set": clean}, upsert=True)
     return get_marketing_settings(db)
 
@@ -98,3 +111,17 @@ def get_fb_credentials(db: Database) -> tuple[str, str, str]:
     token = str(doc.get("fb_page_access_token") or "").strip() or (s.fb_page_access_token or "").strip()
     base_url = str(doc.get("public_base_url") or "").strip().rstrip("/") or (s.public_base_url or "").strip().rstrip("/")
     return page_id, token, base_url
+
+
+def get_ig_credentials(db: Database) -> tuple[str, str]:
+    """Devuelve (ig_user_id, meta_access_token)."""
+    doc = db.app_settings.find_one({"_id": _MKT_KEY}) or {}
+    s = get_settings()
+    ig_user_id = str(doc.get("ig_user_id") or "").strip()
+    token = str(doc.get("fb_page_access_token") or "").strip() or (s.fb_page_access_token or "").strip()
+    return ig_user_id, token
+
+
+def get_tiktok_token(db: Database) -> str:
+    doc = db.app_settings.find_one({"_id": _MKT_KEY}) or {}
+    return str(doc.get("tiktok_access_token") or "").strip()

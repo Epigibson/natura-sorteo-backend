@@ -89,6 +89,8 @@ class MarketingSettingsIn(BaseModel):
     public_base_url: str = Field(default="", max_length=300)
     fb_page_id: str = Field(default="", max_length=80)
     fb_page_access_token: Optional[str] = Field(default=None, max_length=500)
+    ig_user_id: str = Field(default="", max_length=80)
+    tiktok_access_token: Optional[str] = Field(default=None, max_length=500)
     wa_vip_group_jid: str = Field(default="", max_length=120)
     wa_vip_group_invite_url: str = Field(default="", max_length=300)
 
@@ -101,6 +103,8 @@ class MarketingSettingsOut(BaseModel):
     public_base_url: str = ""
     fb_page_id: str = ""
     fb_token_configured: bool = False
+    ig_user_id: str = ""
+    tiktok_configured: bool = False
     evolution_configured: bool = False
     wa_vip_group_jid: str = ""
     wa_vip_group_invite_url: str = ""
@@ -369,4 +373,15 @@ class FacebookPublishIn(BaseModel):
 class WhatsAppGroupPublishIn(BaseModel):
     kind: Literal["launch", "scarcity", "winner"] = "launch"
     base_url: str = Field(default="", max_length=500)
+    image_base64: Optional[str] = Field(default=None, max_length=6_000_000)
+
+
+class InstagramPublishIn(BaseModel):
+    kind: Literal["launch", "milestone_50", "milestone_80", "winner"] = "launch"
+    image_base64: Optional[str] = Field(default=None, max_length=6_000_000)
+
+
+class TikTokPublishIn(BaseModel):
+    kind: Literal["launch", "scarcity", "winner"] = "launch"
+    privacy_level: Literal["SELF_ONLY", "PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS"] = "SELF_ONLY"
     image_base64: Optional[str] = Field(default=None, max_length=6_000_000)

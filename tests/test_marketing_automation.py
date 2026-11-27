@@ -297,3 +297,50 @@ def test_whatsapp_vip_group_announcement_and_invite_url(client, admin, db, raffl
     assert pay.status_code == 200
     assert len(text_calls) == 1
     assert "https://chat.whatsapp.com/ABC123VIP" in text_calls[0]["text"]
+
+
+def test_instagram_and_tiktok_publishers(client, admin, db, raffle, monkeypatch):
+    from app.services import instagram_publisher as igp
+    from app.services import tiktok_publisher as ttp
+
+    rid = raffle["id"]
+    put = client.put(
+        "/api/v1/marketing/settings",
+        headers=admin,
+        json={
+            "fb_page_id": "12345",
+            "fb_page_access_token": "meta-token",
+            "ig_user_id": "1784140000001",
+            "tiktok_access_token": "tt-secret-token",
+        },
+    )
+    assert put.status_code == 200
+    assert put.json()["ig_user_id"] == "1784140000001"
+    assert put.json()["tiktok_configured"] is True
+    assert "tiktok_access_token" not in put.json()
+
+    ig_calls = []
+    tt_calls = []
+    monkeypatch.setattr(igp, "upload_promo_to_cloudinary", lambda b64, **kw: "https://res.cloudinary.com/demo/promo.png")
+    monkeypatch.setattr(igp, "publish_to_instagram_graph", lambda **kw: ig_calls.append(kw) or "ig_media_777")
+    monkeypatch.setattr(ttp, "post_photo_to_tiktok_api", lambda **kw: tt_calls.append(kw) or "tt_pub_888")
+
+    sample_png_b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    res_ig = client.post(
+        f"/api/v1/raffles/{rid}/marketing/instagram",
+        headers=admin,
+        json={"kind": "launch", "image_base64": sample_png_b64},
+    )
+    assert res_ig.status_code == 200
+    assert res_ig.json()["media_id"] == "ig_media_777"
+    assert ig_calls[0]["ig_user_id"] == "1784140000001"
+    assert "LINK EN NUESTRA BIO" in ig_calls[0]["caption"]
+
+    res_tt = client.post(
+        f"/api/v1/raffles/{rid}/marketing/tiktok",
+        headers=admin,
+        json={"kind": "launch", "privacy_level": "SELF_ONLY", "image_base64": sample_png_b64},
+    )
+    assert res_tt.status_code == 200
+    assert res_tt.json()["publish_id"] == "tt_pub_888"
+    assert tt_calls[0]["image_url"] == "https://res.cloudinary.com/demo/promo.png"

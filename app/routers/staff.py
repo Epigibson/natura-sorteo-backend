@@ -15,6 +15,8 @@ from app.schemas import (
     AppSettingsOut,
     ChangePasswordIn,
     FacebookPublishIn,
+    InstagramPublishIn,
+    TikTokPublishIn,
     WhatsAppGroupPublishIn,
     MarketingActionIn,
     MarketingSettingsIn,
@@ -42,7 +44,9 @@ from app.security import (
 from app.services import raffle_service as rs
 from app.services import app_settings as aps
 from app.services import facebook_publisher as fbp
+from app.services import instagram_publisher as igp
 from app.services import marketing_service as mks
+from app.services import tiktok_publisher as ttp
 
 router = APIRouter(prefix="/api/v1", tags=["staff"])
 
@@ -349,6 +353,18 @@ def list_whatsapp_groups(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 
 
+@router.get("/marketing/instagram-account")
+def discover_instagram_account(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    db = get_db()
+    page_id, token, _ = aps.get_fb_credentials(db)
+    try:
+        return igp.discover_instagram_account(page_id=page_id, access_token=token)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
 @router.get("/raffles/{raffle_id}/marketing/status")
 def marketing_status(
     raffle_id: str,
@@ -374,6 +390,22 @@ def marketing_status(
         )
         if row.get("kind")
     ]
+    ig_posts = [
+        row.get("kind")
+        for row in db.audit_log.find(
+            {"action": igp.IG_PUBLISH_ACTION, "raffle_id": str(raffle_id), "status": "ok"},
+            {"kind": 1},
+        )
+        if row.get("kind")
+    ]
+    tiktok_posts = [
+        row.get("kind")
+        for row in db.audit_log.find(
+            {"action": ttp.TIKTOK_PUBLISH_ACTION, "raffle_id": str(raffle_id), "status": "ok"},
+            {"kind": 1},
+        )
+        if row.get("kind")
+    ]
     wa_vip_posts = [
         row.get("kind")
         for row in db.audit_log.find(
@@ -386,8 +418,12 @@ def marketing_status(
         "past_participants_count": len(mks.collect_past_participant_phones(db, raffle_id)),
         "unpaid_with_phone_count": len(unpaid_phones),
         "fb_posts": sorted(set(fb_posts)),
+        "ig_posts": sorted(set(ig_posts)),
+        "tiktok_posts": sorted(set(tiktok_posts)),
         "wa_vip_posts": sorted(set(wa_vip_posts)),
         "fb_configured": bool(settings.get("fb_page_id") and settings.get("fb_token_configured")),
+        "ig_configured": bool(settings.get("ig_user_id") and settings.get("fb_token_configured")),
+        "tiktok_configured": bool(settings.get("tiktok_configured")),
         "evolution_configured": bool(settings.get("evolution_configured")),
         "wa_vip_group_configured": bool(settings.get("wa_vip_group_jid")),
         "past_invite_job": mks.get_latest_past_invite_job(db, raffle_id),
@@ -495,6 +531,43 @@ def marketing_publish_whatsapp_group(
             by=user["sub"],
             base_url=body.base_url or _origin_from_request(request),
             image_base64=body.image_base64,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/marketing/instagram")
+def marketing_publish_instagram(
+    raffle_id: str,
+    body: InstagramPublishIn,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return igp.publish_raffle_instagram(
+            get_db(),
+            raffle_id,
+            kind=body.kind,
+            by=user["sub"],
+            image_base64=body.image_base64,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@router.post("/raffles/{raffle_id}/marketing/tiktok")
+def marketing_publish_tiktok(
+    raffle_id: str,
+    body: TikTokPublishIn,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict:
+    try:
+        return ttp.publish_raffle_tiktok(
+            get_db(),
+            raffle_id,
+            kind=body.kind,
+            by=user["sub"],
+            image_base64=body.image_base64,
+            privacy_level=body.privacy_level,
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
