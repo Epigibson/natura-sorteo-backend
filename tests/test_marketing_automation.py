@@ -215,29 +215,41 @@ def test_facebook_publish_and_milestone_auto_trigger(client, admin, db, monkeypa
     rid = r["id"]
 
     fb_calls = []
+    comment_calls = []
     monkeypatch.setattr(fbp, "post_to_facebook_graph", lambda **kw: fb_calls.append(kw) or "post_999")
+    monkeypatch.setattr(fbp, "post_comment_to_facebook_graph", lambda **kw: comment_calls.append(kw) or "comment_111")
 
-    # Publicación manual de lanzamiento
+    # Publicación manual de lanzamiento con imagen promo en base64
+    sample_png_b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
     pub = client.post(
         f"/api/v1/raffles/{rid}/marketing/facebook",
         headers=admin,
-        json={"kind": "launch", "base_url": "https://sorteo.test"},
+        json={"kind": "launch", "base_url": "https://sorteo.test", "image_base64": sample_png_b64},
     )
     assert pub.status_code == 200
     assert pub.json()["post_id"] == "post_999"
+    assert pub.json()["comment_id"] == "comment_111"
     assert len(fb_calls) == 1
     assert "Set Ekos" in fb_calls[0]["message"]
+    assert "primer comentario" in fb_calls[0]["message"]
+    assert "https://sorteo.test" not in fb_calls[0]["message"]
+    assert fb_calls[0]["image_bytes"] is not None and fb_calls[0]["image_bytes"].startswith(b"\x89PNG")
+    assert len(comment_calls) == 1
+    assert comment_calls[0]["post_id"] == "post_999"
+    assert f"https://sorteo.test/sorteo/{r['slug']}" in comment_calls[0]["message"]
 
-    # Cobrar 2 de 4 boletos (50%) -> dispara milestone_50 automático
+    # Cobrar 2 de 4 boletos (50%) -> dispara milestone_50 automático + primer comentario
     for folio in (1, 2):
         client.post(f"/api/v1/raffles/{rid}/tickets/{folio}/assign", headers=admin, json={"name": f"User {folio}", "phone": f"551122330{folio}"})
         client.post(f"/api/v1/raffles/{rid}/tickets/{folio}/pay", headers=admin, json={})
 
     assert any("mitad" in c["message"] for c in fb_calls)
+    assert len(comment_calls) == 2
 
-    # Cobrar 4 de 4 boletos (100% >= 80%) -> dispara milestone_80 automático
+    # Cobrar 4 de 4 boletos (100% >= 80%) -> dispara milestone_80 automático + primer comentario
     for folio in (3, 4):
         client.post(f"/api/v1/raffles/{rid}/tickets/{folio}/assign", headers=admin, json={"name": f"User {folio}", "phone": f"551122330{folio}"})
         client.post(f"/api/v1/raffles/{rid}/tickets/{folio}/pay", headers=admin, json={})
 
     assert any("ÚLTIMOS" in c["message"] for c in fb_calls)
+    assert len(comment_calls) == 3

@@ -450,6 +450,7 @@ def marketing_publish_facebook(
             base_url=body.base_url or _origin_from_request(request),
             by=user["sub"],
             force=body.force,
+            image_base64=body.image_base64,
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))

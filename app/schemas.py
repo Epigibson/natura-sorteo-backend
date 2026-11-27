@@ -359,3 +359,4 @@ class FacebookPublishIn(BaseModel):
     kind: Literal["launch", "milestone_50", "milestone_80", "winner"] = "launch"
     base_url: str = Field(default="", max_length=500)
     force: bool = False
+    image_base64: Optional[str] = Field(default=None, max_length=6_000_000)
