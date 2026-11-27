@@ -748,3 +748,29 @@ def test_settings_change_is_audited(client, admin, db):
     doc = db.audit_log.find_one({"action": "settings_update"})
     assert doc and doc["previous"]["auto_release_hours"] == 48
     assert doc["current"]["auto_release_hours"] == 6
+
+
+def test_public_organizer_whatsapp_from_env(client, raffle, monkeypatch):
+    from app.config import get_settings
+
+    # Sin ORGANIZER_WHATSAPP explícito, usa SEED_ADMIN_PHONE
+    monkeypatch.delenv("ORGANIZER_WHATSAPP", raising=False)
+    get_settings.cache_clear()
+    try:
+        r_pub = client.get(f"/api/v1/public/raffles/{raffle['slug']}")
+        r_board = client.get(f"/api/v1/public/raffles/{raffle['slug']}/board")
+        assert r_pub.status_code == 200
+        assert r_board.status_code == 200
+        assert r_pub.json()["organizer_whatsapp"] == "5500000000"
+        assert r_board.json()["organizer_whatsapp"] == "5500000000"
+
+        # Con ORGANIZER_WHATSAPP explícito, limpia formato y prioriza esa variable
+        monkeypatch.setenv("ORGANIZER_WHATSAPP", "+52 442-123-4567")
+        get_settings.cache_clear()
+        r_pub2 = client.get(f"/api/v1/public/raffles/{raffle['slug']}")
+        r_board2 = client.get(f"/api/v1/public/raffles/{raffle['slug']}/board")
+        assert r_pub2.json()["organizer_whatsapp"] == "524421234567"
+        assert r_board2.json()["organizer_whatsapp"] == "524421234567"
+    finally:
+        monkeypatch.delenv("ORGANIZER_WHATSAPP", raising=False)
+        get_settings.cache_clear()

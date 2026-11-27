@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     seed_admin_password: str = Field(min_length=8)
     seed_admin_name: str = "Yuri"
 
+    # WhatsApp de la organizadora donde llegan comprobantes (si se deja vacío, usa SEED_ADMIN_PHONE)
+    organizer_whatsapp: str = ""
+
+    def effective_organizer_whatsapp(self) -> str:
+        raw = (self.organizer_whatsapp or "").strip() or (self.seed_admin_phone or "").strip()
+        return "".join(c for c in raw if c.isdigit())
+
     # Zona horaria del sorteo y proxies de confianza (Vercel -> Render = 2)
     timezone: str = "America/Mexico_City"
     proxy_hops: int = 2

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request, status
 
+from app.config import get_settings
 from app.db import get_db
 from app.schemas import (
     AccessCheckIn,
@@ -53,6 +54,7 @@ def public_raffle(slug: str) -> dict:
         "drawn": drawn,
         "winner_folio": winner.get("folio") if drawn else None,
         "winner_name": (winner.get("participant") or {}).get("name") if drawn else None,
+        "organizer_whatsapp": get_settings().effective_organizer_whatsapp() or None,
     }
 
 
@@ -108,6 +110,7 @@ def public_board(slug: str) -> dict:
         "free_count": free,
         "participating_folios": participating,
         "drawn_at": drawn_at.isoformat() if drawn and drawn_at else None,
+        "organizer_whatsapp": get_settings().effective_organizer_whatsapp() or None,
         "cards": cards,
     }
 
